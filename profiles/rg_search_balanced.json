@@ -1,0 +1,8 @@
+{
+  "name": "rg_search_balanced",
+  "description": "Balanced read-only repository scout for deeper cross-file evidence gathering.",
+  "model": "gpt-5.6-terra",
+  "model_reasoning_effort": "medium",
+  "sandbox_mode": "read-only",
+  "instructions_id": "rg-scout-v1"
+}

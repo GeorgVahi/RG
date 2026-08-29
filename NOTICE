@@ -1,0 +1,4 @@
+RG's exact-model routing, read-only discovery contract, worktree fingerprint,
+profile precedence, and fail-closed transport policy are adapted from
+OpenBuild 2.4.1 (https://github.com/GeorgVahi/OpenBuild), also distributed
+under the MIT License.

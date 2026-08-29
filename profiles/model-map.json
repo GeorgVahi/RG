@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "name": "RG defaults",
+  "routes": {
+    "auto": {
+      "agents": ["rg_search_fast", "rg_search_balanced"],
+      "max_steps": 2,
+      "escalation_mode": "after-evidence",
+      "escalation_triggers": [
+        "insufficient-evidence",
+        "ambiguous-ownership",
+        "cross-file-gap"
+      ],
+      "stop_on_success": true,
+      "transport_failure": "block",
+      "fallback": "targeted-root"
+    },
+    "fast": {
+      "agents": ["rg_search_fast"],
+      "max_steps": 1,
+      "escalation_mode": "after-evidence",
+      "escalation_triggers": [
+        "insufficient-evidence",
+        "ambiguous-ownership",
+        "cross-file-gap"
+      ],
+      "stop_on_success": true,
+      "transport_failure": "block",
+      "fallback": "targeted-root"
+    },
+    "deep": {
+      "agents": ["rg_search_balanced"],
+      "max_steps": 1,
+      "escalation_mode": "after-evidence",
+      "escalation_triggers": [],
+      "stop_on_success": true,
+      "transport_failure": "block",
+      "fallback": "targeted-root"
+    }
+  }
+}

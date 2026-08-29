@@ -1,0 +1,8 @@
+{
+  "name": "rg_search_fast",
+  "description": "Fast read-only repository scout for focused and high-volume code search.",
+  "model": "gpt-5.6-luna",
+  "model_reasoning_effort": "low",
+  "sandbox_mode": "read-only",
+  "instructions_id": "rg-scout-v1"
+}

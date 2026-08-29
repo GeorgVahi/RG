@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RG repository discovery result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "worktree_fingerprint",
+    "summary",
+    "owners",
+    "couplings",
+    "tests",
+    "flows",
+    "constraints",
+    "uncertainties"
+  ],
+  "properties": {
+    "schema": { "type": "string", "const": "rg.discovery.v1" },
+    "worktree_fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest", "files", "bytes", "inventory"],
+      "properties": {
+        "algorithm": { "type": "string", "const": "sha256" },
+        "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "files": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "bytes": { "type": "integer", "minimum": 0, "maximum": 2147483648 },
+        "inventory": { "type": "string", "const": "git-tracked-untracked-nonignored-v1" }
+      }
+    },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 8192 },
+    "owners": { "$ref": "#/$defs/evidenceArray" },
+    "couplings": { "$ref": "#/$defs/evidenceArray" },
+    "tests": { "$ref": "#/$defs/evidenceArray" },
+    "flows": { "$ref": "#/$defs/evidenceArray" },
+    "constraints": { "$ref": "#/$defs/stringArray" },
+    "uncertainties": { "$ref": "#/$defs/stringArray" }
+  },
+  "$defs": {
+    "evidenceArray": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/evidence" }
+    },
+    "stringArray": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "type": "string", "minLength": 1, "maxLength": 2000 }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "line_start",
+        "line_end",
+        "symbol",
+        "reason",
+        "kind",
+        "related_path"
+      ],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "line_start": { "type": "integer", "minimum": 1 },
+        "line_end": { "type": "integer", "minimum": 1 },
+        "symbol": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 2000 },
+        "kind": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+        "related_path": { "type": ["string", "null"], "minLength": 1, "maxLength": 1024 }
+      }
+    }
+  }
+}

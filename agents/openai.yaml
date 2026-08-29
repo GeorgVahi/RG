@@ -1,0 +1,6 @@
+interface:
+  display_name: "RG"
+  short_description: "Luna-first exact-model repository code search"
+  default_prompt: "Use $rg to map the relevant code, owners, tests, and cross-file flows before making changes."
+policy:
+  allow_implicit_invocation: true
