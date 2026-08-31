@@ -41,9 +41,13 @@ Use `--mode fast` only when the request explicitly prefers the cheapest single L
 
 Keep the request bounded and outcome-oriented. Include the symbols, behavior, suspected area, or evidence needed, but do not paste unrelated chat history.
 
+The route may outlive the shell tool's initial wait window. If the invocation returns a live `session_id` or `cell_id` without a terminal `exit_code`, the runner is still working: continue the same process with the tool's `write_stdin` or `wait` mechanism until it exits. Lines such as `RG: starting ...` and `RG: completed ...` are progress messages, not the structured result and not a failure. Never start fallback recovery while that process is live.
+
 ## Consume the result
 
 Accept the result only when the runner returns `schema: "rg.run.v1"` and `status` is `completed` or `completed_with_gaps`. The nested `result` has the strict `rg.discovery.v1` evidence contract.
+
+Classify the runner as failed only after the process has exited or otherwise reached a terminal state without a valid result. Parse the accumulated output through the final `rg.run.v1` object; do not judge an in-progress output chunk in isolation.
 
 - Use its owners, tests, couplings, flows, constraints, and uncertainties as a map.
 - Verify material conclusions with targeted reads of returned `path:line` ranges.

@@ -62,6 +62,8 @@ node scripts/rg.mjs doctor --repo <git-root>
 - `fast`: one Luna pass.
 - `deep`: one explicitly requested Terra pass.
 
+An `auto` search can take longer than a shell tool's initial wait window. A returned live `session_id` is an in-progress command, not a failed search: keep polling that same session until the process exits and emits the final `rg.run.v1` JSON. The `RG: starting ...` and `RG: completed ...` lines are progress only.
+
 Configuration precedence and the immutable routing constraints are documented in [references/configuration.md](references/configuration.md).
 
 ## Verify

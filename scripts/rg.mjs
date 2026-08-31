@@ -936,7 +936,10 @@ async function runProfile({ profile, repo, query, map, codexBin, timeoutMs, expe
     result_evidence: "missing",
   });
 
-  process.stderr.write(`RG: starting ${profile.name} (${profile.model}/${profile.model_reasoning_effort})\n`);
+  process.stderr.write(
+    `RG: starting ${profile.name} (${profile.model}/${profile.model_reasoning_effort}); ` +
+      "still running; wait for final rg.run.v1\n",
+  );
   const environment = scrubEnvironment(process.env);
   let outcome;
   try {
