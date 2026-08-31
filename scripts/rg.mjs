@@ -383,15 +383,15 @@ async function validateEvidenceArray(name, value, repo, snapshot) {
       !Number.isInteger(item.line_start) ||
       !Number.isInteger(item.line_end) ||
       item.line_start < 1 ||
-      item.line_end < item.line_start ||
-      item.line_end - item.line_start + 1 > MAX_LINE_SPAN
+      item.line_end < item.line_start
     ) {
       throw new RGError(`${name}[${index}] has an invalid line range`, "invalid-result");
     }
     const lines = snapshot.lineCounts.get(relative) ?? 0;
-    if (lines < item.line_end) {
-      throw new RGError(`${name}[${index}] line range exceeds the file`, "invalid-result");
+    if (lines < item.line_start) {
+      throw new RGError(`${name}[${index}] line range does not overlap the file`, "invalid-result");
     }
+    item.line_end = Math.min(item.line_end, lines, item.line_start + MAX_LINE_SPAN - 1);
     assertString(item.symbol, `${name}[${index}].symbol`, 512);
     assertString(item.reason, `${name}[${index}].reason`, 2000);
     if (item.kind !== null) assertString(item.kind, `${name}[${index}].kind`, 128);

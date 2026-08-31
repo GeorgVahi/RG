@@ -8,7 +8,7 @@ Its default route is deterministic:
 2. `gpt-5.6-terra` with medium reasoning runs only after a valid Luna result reports a configured semantic evidence gap.
 3. Authentication, availability, quota, timeout, malformed output, and fingerprint failures stop the route. They never silently switch models.
 
-The implementation adapts OpenBuild's exact-model worker pattern: explicit `codex exec -m`, pinned reasoning effort, ChatGPT subscription authentication, provider/env hardening, read-only sandboxing, multi-agent disabling, strict JSON evidence, worktree fingerprints, bounded artifacts, and terminal receipts.
+The implementation adapts OpenBuild's exact-model worker pattern: explicit `codex exec -m`, pinned reasoning effort, ChatGPT subscription authentication, provider/env hardening, read-only sandboxing, multi-agent disabling, strict JSON evidence with safe line-range bounding, worktree fingerprints, bounded artifacts, and terminal receipts.
 
 ## Requirements
 

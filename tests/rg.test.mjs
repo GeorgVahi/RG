@@ -109,7 +109,7 @@ test("strict discovery validation accepts evidence and extracts a semantic trigg
   }
 });
 
-test("strict discovery validation rejects repository escapes and oversized ranges", async () => {
+test("strict discovery validation rejects repository escapes and malformed ranges", async () => {
   const directory = await fixture();
   try {
     const snapshot = await computeFingerprint(directory);
@@ -120,10 +120,45 @@ test("strict discovery validation rejects repository escapes and oversized range
       (error) => error instanceof RGError && error.code === "invalid-path",
     );
 
-    const oversized = discovery(snapshot);
-    oversized.owners[0].line_end = 500;
+    const inverted = discovery(snapshot);
+    inverted.owners[0].line_start = 3;
+    inverted.owners[0].line_end = 2;
     await assert.rejects(
-      validateResultObject(oversized, directory, snapshot),
+      validateResultObject(inverted, directory, snapshot),
+      (error) => error instanceof RGError && error.code === "invalid-result",
+    );
+  } finally {
+    await dispose(directory);
+  }
+});
+
+test("strict discovery validation bounds usable model line ranges", async () => {
+  const directory = await fixture();
+  try {
+    const longSource = Array.from({ length: 300 }, (_, index) => `// line ${index + 1}`).join("\n");
+    await fs.writeFile(path.join(directory, "source.js"), `${longSource}\n`);
+    const snapshot = await computeFingerprint(directory);
+
+    const oversized = discovery(snapshot);
+    oversized.owners[0].line_start = 25;
+    oversized.owners[0].line_end = 250;
+    await validateResultObject(oversized, directory, snapshot);
+    assert.deepEqual(
+      [oversized.owners[0].line_start, oversized.owners[0].line_end],
+      [25, 224],
+    );
+
+    const pastEnd = discovery(snapshot);
+    pastEnd.owners[0].line_start = 275;
+    pastEnd.owners[0].line_end = 350;
+    await validateResultObject(pastEnd, directory, snapshot);
+    assert.deepEqual([pastEnd.owners[0].line_start, pastEnd.owners[0].line_end], [275, 300]);
+
+    const noOverlap = discovery(snapshot);
+    noOverlap.owners[0].line_start = 301;
+    noOverlap.owners[0].line_end = 350;
+    await assert.rejects(
+      validateResultObject(noOverlap, directory, snapshot),
       (error) => error instanceof RGError && error.code === "invalid-result",
     );
   } finally {
