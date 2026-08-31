@@ -369,6 +369,7 @@ async function validateEvidenceArray(name, value, repo, snapshot) {
     "related_path",
   ]);
   const required = allowed;
+  const normalizedLineEnds = [];
   for (let index = 0; index < value.length; index += 1) {
     const item = value[index];
     if (!item || typeof item !== "object" || Array.isArray(item)) {
@@ -391,7 +392,7 @@ async function validateEvidenceArray(name, value, repo, snapshot) {
     if (lines < item.line_start) {
       throw new RGError(`${name}[${index}] line range does not overlap the file`, "invalid-result");
     }
-    item.line_end = Math.min(item.line_end, lines, item.line_start + MAX_LINE_SPAN - 1);
+    normalizedLineEnds.push(Math.min(item.line_end, lines, item.line_start + MAX_LINE_SPAN - 1));
     assertString(item.symbol, `${name}[${index}].symbol`, 512);
     assertString(item.reason, `${name}[${index}].reason`, 2000);
     if (item.kind !== null) assertString(item.kind, `${name}[${index}].kind`, 128);
@@ -404,6 +405,7 @@ async function validateEvidenceArray(name, value, repo, snapshot) {
       );
     }
   }
+  return normalizedLineEnds;
 }
 
 function validateStringArray(name, value) {
@@ -449,10 +451,16 @@ async function validateResultObject(value, repo, snapshot) {
   }
   validateFingerprint(value.worktree_fingerprint, snapshot);
   assertString(value.summary, "summary", 8192);
-  await validateEvidenceArray("owners", value.owners, repo, snapshot);
-  await validateEvidenceArray("couplings", value.couplings, repo, snapshot);
-  await validateEvidenceArray("tests", value.tests, repo, snapshot);
-  await validateEvidenceArray("flows", value.flows, repo, snapshot);
+  const evidenceGroups = [
+    ["owners", value.owners],
+    ["couplings", value.couplings],
+    ["tests", value.tests],
+    ["flows", value.flows],
+  ];
+  const normalizedGroups = [];
+  for (const [name, items] of evidenceGroups) {
+    normalizedGroups.push([items, await validateEvidenceArray(name, items, repo, snapshot)]);
+  }
   validateStringArray("constraints", value.constraints);
   validateStringArray("uncertainties", value.uncertainties);
   const stringBudget = Buffer.byteLength(
@@ -469,7 +477,13 @@ async function validateResultObject(value, repo, snapshot) {
   if (stringBudget > MAX_RESULT_STRING_BYTES) {
     throw new RGError("result string budget exceeded", "invalid-result");
   }
-  return extractTriggers(value.uncertainties);
+  const triggers = extractTriggers(value.uncertainties);
+  for (const [items, lineEnds] of normalizedGroups) {
+    for (let index = 0; index < items.length; index += 1) {
+      items[index].line_end = lineEnds[index];
+    }
+  }
+  return triggers;
 }
 
 async function readAndValidateResult(resultFile, repo, snapshot) {
@@ -485,7 +499,18 @@ async function readAndValidateResult(resultFile, repo, snapshot) {
     if (error instanceof RGError) throw error;
     throw new RGError("result artifact is not strict JSON", "invalid-result");
   }
-  const triggers = await validateResultObject(value, repo, snapshot);
+  let triggers;
+  try {
+    triggers = await validateResultObject(value, repo, snapshot);
+  } catch (error) {
+    if (error instanceof RGError && error.code !== "invalid-result") {
+      throw new RGError(error.message, "invalid-result", {
+        ...(error.details ?? {}),
+        validation_code: error.code,
+      });
+    }
+    throw error;
+  }
   return { value, triggers };
 }
 
@@ -1264,6 +1289,7 @@ export {
   executeResolvedRoute,
   extractTriggers,
   performSearch,
+  readAndValidateResult,
   resolveGitRoot,
   resolveRoute,
   scrubEnvironment,

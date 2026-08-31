@@ -10,6 +10,8 @@ Its default route is deterministic:
 
 The implementation adapts OpenBuild's exact-model worker pattern: explicit `codex exec -m`, pinned reasoning effort, ChatGPT subscription authentication, provider/env hardening, read-only sandboxing, multi-agent disabling, strict JSON evidence with safe line-range bounding, worktree fingerprints, bounded artifacts, and terminal receipts.
 
+Line ranges that begin inside a repository file are bounded to that file and to 200 lines in the returned result. The raw model artifact is retained unchanged in the run directory for auditability.
+
 ## Requirements
 
 - Node.js 20 or newer

@@ -12,6 +12,7 @@ import {
   computeFingerprint,
   executeResolvedRoute,
   extractTriggers,
+  readAndValidateResult,
   scrubEnvironment,
   validateModelMap,
   validateProfile,
@@ -127,6 +128,20 @@ test("strict discovery validation rejects repository escapes and malformed range
       validateResultObject(inverted, directory, snapshot),
       (error) => error instanceof RGError && error.code === "invalid-result",
     );
+
+    for (const [lineStart, lineEnd] of [
+      [0, 1],
+      [1.5, 2],
+      [1, 2.5],
+    ]) {
+      const malformed = discovery(snapshot);
+      malformed.owners[0].line_start = lineStart;
+      malformed.owners[0].line_end = lineEnd;
+      await assert.rejects(
+        validateResultObject(malformed, directory, snapshot),
+        (error) => error instanceof RGError && error.code === "invalid-result",
+      );
+    }
   } finally {
     await dispose(directory);
   }
@@ -139,14 +154,25 @@ test("strict discovery validation bounds usable model line ranges", async () => 
     await fs.writeFile(path.join(directory, "source.js"), `${longSource}\n`);
     const snapshot = await computeFingerprint(directory);
 
-    const oversized = discovery(snapshot);
-    oversized.owners[0].line_start = 25;
-    oversized.owners[0].line_end = 250;
-    await validateResultObject(oversized, directory, snapshot);
-    assert.deepEqual(
-      [oversized.owners[0].line_start, oversized.owners[0].line_end],
-      [25, 224],
-    );
+    const allGroups = discovery(snapshot);
+    const evidence = { ...allGroups.owners[0], line_start: 25, line_end: 250 };
+    allGroups.owners[0] = { ...evidence, symbol: "owner" };
+    allGroups.couplings.push({ ...evidence, symbol: "coupling" });
+    allGroups.tests.push({ ...evidence, symbol: "test" });
+    allGroups.flows.push({ ...evidence, symbol: "flow" });
+    await validateResultObject(allGroups, directory, snapshot);
+    for (const group of ["owners", "couplings", "tests", "flows"]) {
+      assert.deepEqual(
+        [allGroups[group][0].line_start, allGroups[group][0].line_end],
+        [25, 224],
+      );
+    }
+
+    const exactLimit = discovery(snapshot);
+    exactLimit.owners[0].line_start = 101;
+    exactLimit.owners[0].line_end = 300;
+    await validateResultObject(exactLimit, directory, snapshot);
+    assert.deepEqual([exactLimit.owners[0].line_start, exactLimit.owners[0].line_end], [101, 300]);
 
     const pastEnd = discovery(snapshot);
     pastEnd.owners[0].line_start = 275;
@@ -160,6 +186,98 @@ test("strict discovery validation bounds usable model line ranges", async () => 
     await assert.rejects(
       validateResultObject(noOverlap, directory, snapshot),
       (error) => error instanceof RGError && error.code === "invalid-result",
+    );
+  } finally {
+    await dispose(directory);
+  }
+});
+
+test("failed discovery validation never partially normalizes evidence", async () => {
+  const directory = await fixture();
+  try {
+    const snapshot = await computeFingerprint(directory);
+
+    const invalidOwner = discovery(snapshot);
+    invalidOwner.owners[0].line_end = 500;
+    invalidOwner.owners[0].symbol = "";
+    await assert.rejects(
+      validateResultObject(invalidOwner, directory, snapshot),
+      (error) => error instanceof RGError && error.code === "invalid-contract",
+    );
+    assert.equal(invalidOwner.owners[0].line_end, 500);
+
+    const invalidLateGroup = discovery(snapshot);
+    invalidLateGroup.owners[0].line_end = 500;
+    invalidLateGroup.flows.push({ ...invalidLateGroup.owners[0], line_end: 3, symbol: "" });
+    await assert.rejects(
+      validateResultObject(invalidLateGroup, directory, snapshot),
+      (error) => error instanceof RGError && error.code === "invalid-contract",
+    );
+    assert.equal(invalidLateGroup.owners[0].line_end, 500);
+
+    const invalidTrigger = discovery(snapshot);
+    invalidTrigger.owners[0].line_end = 500;
+    invalidTrigger.uncertainties.push("trigger:not-configured: invalid trigger must reject the result");
+    await assert.rejects(
+      validateResultObject(invalidTrigger, directory, snapshot),
+      (error) => error instanceof RGError && error.code === "invalid-result",
+    );
+    assert.equal(invalidTrigger.owners[0].line_end, 500);
+  } finally {
+    await dispose(directory);
+  }
+});
+
+test("fingerprint line counts cover empty, final-newline, and CRLF files", async () => {
+  const directory = await fixture();
+  try {
+    const cases = [
+      ["empty.js", "", 1],
+      ["no-final-newline.js", "one", 1],
+      ["final-newline.js", "one\n", 1],
+      ["crlf.js", "one\r\ntwo\r\n", 2],
+    ];
+    for (const [relative, contents] of cases) {
+      await fs.writeFile(path.join(directory, relative), contents);
+    }
+    const snapshot = await computeFingerprint(directory);
+    for (const [relative, , expectedLines] of cases) {
+      assert.equal(snapshot.lineCounts.get(relative), expectedLines, relative);
+      const value = discovery(snapshot);
+      value.owners[0].path = relative;
+      value.owners[0].line_end = expectedLines;
+      await validateResultObject(value, directory, snapshot);
+    }
+  } finally {
+    await dispose(directory);
+  }
+});
+
+test("result artifact stays raw while the accepted value is normalized", async () => {
+  const directory = await fixture();
+  try {
+    const longSource = Array.from({ length: 300 }, (_, index) => `// line ${index + 1}`).join("\n");
+    await fs.writeFile(path.join(directory, "source.js"), `${longSource}\n`);
+    const snapshot = await computeFingerprint(directory);
+    const resultFile = path.join(directory, "result.json");
+    const rawValue = discovery(snapshot);
+    rawValue.owners[0].line_end = 250;
+    await fs.writeFile(resultFile, `${JSON.stringify(rawValue)}\n`);
+
+    const validated = await readAndValidateResult(resultFile, directory, snapshot);
+    assert.equal(validated.value.owners[0].line_end, 200);
+    assert.deepEqual(validated.triggers, []);
+    assert.equal(JSON.parse(await fs.readFile(resultFile, "utf8")).owners[0].line_end, 250);
+
+    const invalidValue = discovery(snapshot);
+    invalidValue.owners[0].symbol = "";
+    await fs.writeFile(resultFile, `${JSON.stringify(invalidValue)}\n`);
+    await assert.rejects(
+      readAndValidateResult(resultFile, directory, snapshot),
+      (error) =>
+        error instanceof RGError &&
+        error.code === "invalid-result" &&
+        error.details.validation_code === "invalid-contract",
     );
   } finally {
     await dispose(directory);
