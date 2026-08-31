@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   RGError,
   buildCodexArgs,
@@ -57,6 +58,29 @@ function discovery(snapshot) {
 
 test("canonical JSON is stable across object key order", () => {
   assert.equal(canonicalJson({ b: 2, a: 1 }), canonicalJson({ a: 1, b: 2 }));
+});
+
+test("CLI entrypoint runs when the skill directory is reached through a link", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rg-test-link-"));
+  const linked = path.join(directory, "rg");
+  const repository = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+  try {
+    await fs.symlink(repository, linked, process.platform === "win32" ? "junction" : "dir");
+    const result = spawnSync(
+      process.execPath,
+      [path.join(linked, "scripts", "rg.mjs"), "help"],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /RG exact-model repository search/);
+  } finally {
+    try {
+      await fs.unlink(linked);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    await dispose(directory);
+  }
 });
 
 test("fingerprint is stable and detects worktree content changes", async () => {

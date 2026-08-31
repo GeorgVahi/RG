@@ -8,7 +8,7 @@ import process from "node:process";
 import { createHash, randomBytes } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PACKAGED_PROFILES = path.join(ROOT, "profiles");
@@ -81,6 +81,30 @@ function canonicalJson(value) {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function canonicalEntrypoint(file) {
+  const resolved = path.resolve(file);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function isMainModule(argv1 = process.argv[1], moduleUrl = import.meta.url) {
+  if (!argv1) return false;
+  let modulePath;
+  try {
+    modulePath = fileURLToPath(moduleUrl);
+  } catch {
+    return false;
+  }
+  const invokedPath = canonicalEntrypoint(argv1);
+  const loadedPath = canonicalEntrypoint(modulePath);
+  return process.platform === "win32"
+    ? invokedPath.toLowerCase() === loadedPath.toLowerCase()
+    : invokedPath === loadedPath;
 }
 
 function sha256(value) {
@@ -1246,7 +1270,7 @@ export {
   validateSubscriptionConfig,
 };
 
-const invoked = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+const invoked = isMainModule();
 if (invoked) {
   main().catch((error) => {
     const code = error instanceof RGError ? error.code : "unexpected-error";
