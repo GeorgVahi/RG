@@ -1,0 +1,8 @@
+{
+  "schema": "rg.regression-fixture.v1",
+  "name": "invented-intermediate-directory",
+  "inventory_path": "magic-entry/MagicEntryApp.mqh",
+  "rejected_field": "flows[0].path",
+  "rejected_path": "magic-entry/app/MagicEntryApp.mqh",
+  "expected_message": "flows[0].path is outside the fingerprint inventory"
+}

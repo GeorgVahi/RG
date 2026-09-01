@@ -15,6 +15,11 @@ const required = [
   "profiles/rg_search_balanced.json",
   "schemas/discovery.schema.json",
   "scripts/rg.mjs",
+  "scripts/canary.mjs",
+  "tests/rg.test.mjs",
+  "tests/rg.integration.test.mjs",
+  "tests/fixtures/fake-codex.mjs",
+  ".github/workflows/ci.yml",
 ];
 
 for (const relative of required) {
@@ -59,6 +64,20 @@ validateModelMap(await readJson("profiles/model-map.json"), "profiles/model-map.
 const schema = await readJson("schemas/discovery.schema.json");
 if (schema.type !== "object" || schema.additionalProperties !== false) {
   throw new Error("discovery schema must be a closed object schema");
+}
+
+const packageJson = await readJson("package.json");
+for (const script of ["test", "test:unit", "test:integration", "canary", "validate", "doctor", "diff-check", "check"]) {
+  if (typeof packageJson.scripts?.[script] !== "string" || !packageJson.scripts[script].trim()) {
+    throw new Error(`package.json must retain the ${script} reliability script`);
+  }
+}
+
+const workflow = await fs.readFile(path.join(root, ".github", "workflows", "ci.yml"), "utf8");
+for (const requiredWorkflowToken of ["windows-latest", "ubuntu-latest", "npm run check"]) {
+  if (!workflow.includes(requiredWorkflowToken)) {
+    throw new Error(`CI workflow must retain ${requiredWorkflowToken}`);
+  }
 }
 
 process.stdout.write("RG skill validation passed.\n");

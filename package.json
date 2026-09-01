@@ -1,6 +1,6 @@
 {
   "name": "@georgvahi/rg-skill",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "Exact-model Luna-first repository search skill for Codex",
   "type": "module",
@@ -9,8 +9,13 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
+    "test:unit": "node --test tests/rg.test.mjs",
+    "test:integration": "node --test tests/rg.integration.test.mjs",
+    "canary": "node scripts/canary.mjs",
     "validate": "node scripts/validate-skill.mjs",
-    "doctor": "node scripts/rg.mjs doctor --repo ."
+    "doctor": "node scripts/rg.mjs doctor --repo .",
+    "diff-check": "git diff --check",
+    "check": "npm run validate && npm run test:unit && npm run test:integration && npm run canary && npm run diff-check"
   },
   "repository": {
     "type": "git",
