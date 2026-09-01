@@ -20,7 +20,7 @@ For a parsed result whose only defects are explicitly repairable contract errors
 
 When owner recomputation proves that the repository changed during a read-only route, RG reports a typed `rg.fingerprint-drift.v1` diagnostic with the phase, before/after fingerprints, change counts, and at most 20 changed repository paths. It discards that route attempt and restarts the whole configured route exactly once from Luna in `auto`/`fast` (or Terra in explicitly requested `deep`) against a fresh fingerprint. The first attempt and receipt remain disclosed under `restart.discarded_steps`. A second drift, an unstructured drift claim, a model-returned fingerprint mismatch, or any transport/contract failure is terminal; none can consume the restart as a hidden model fallback.
 
-Each active run holds a contract-bound heartbeat lease and every in-process exception is terminalized into its receipt. Before search, run-store maintenance marks a `running` receipt older than two hours as failed only when no recent/live lease with the same run ID exists; a future-dated heartbeat is not considered recent without a valid live-owner contract. Receipt lifecycle timestamps from the future are invalid and fail closed. It removes only validated terminal RG run directories: older than 14 days, or beyond the newest 200 after a 24-hour grace period. The home, `rg`, and `runs` directory chain must be real and nonlinked; run creation and every later artifact mutation revalidate that same boundary and the run-directory identity. Per-run atomic maintenance claims serialize reconciliation and deletion so concurrent maintenance counts an object only once. Unknown, malformed, linked, active, and recent entries are never deleted. `doctor` reports the same counters in read-only mode; completed search output includes the maintenance summary.
+Each active run holds a contract-bound heartbeat lease and emits machine-readable `rg.progress.v1` status immediately and every 30 seconds. Every in-process exception is terminalized into its receipt. The read-only `status` command resolves an exact run ID or receipt and returns `rg.status.v1`; polling-window counts never affect state, and `fallback_allowed` is true only for a validated terminal failed receipt. Before search, run-store maintenance marks a `running` receipt older than two hours as failed only when no recent/live lease with the same run ID exists; a future-dated heartbeat is not considered recent without a valid live-owner contract. Receipt lifecycle timestamps from the future are invalid and fail closed. It removes only validated terminal RG run directories: older than 14 days, or beyond the newest 200 after a 24-hour grace period. The home, `rg`, and `runs` directory chain must be real and nonlinked; run creation and every later artifact mutation revalidate that same boundary and the run-directory identity. Per-run atomic maintenance claims serialize reconciliation and deletion so concurrent maintenance counts an object only once. Unknown, malformed, linked, active, and recent entries are never deleted. `doctor` reports the same counters in read-only mode; completed search output includes the maintenance summary.
 
 ## Requirements
 
@@ -54,7 +54,7 @@ Start a new Codex session after installation so the skill catalog is reloaded. T
 ```md
 ## Default repository search
 
-- Before non-trivial repository grep, file/symbol/owner/test discovery, dependency tracing, or cross-file evidence gathering, use the installed $rg skill. Direct reads remain appropriate for an explicit or already-known path and for Git metadata.
+- Before non-trivial repository grep, file/symbol/owner/test discovery, dependency tracing, or cross-file evidence gathering, use the installed $rg skill. Direct reads remain appropriate for an explicit or already-known path and for Git metadata. A live RG `session_id`/`cell_id` is still running regardless of how many polling windows elapse; keep waiting on the same process, and permit targeted fallback only after a terminal failure or `rg.status.v1` with `terminal: true` and `fallback_allowed: true`.
 ```
 
 ## Use
@@ -67,6 +67,8 @@ The runner can also be invoked directly:
 node scripts/rg.mjs search --repo <git-root> --mode auto --query <bounded request>
 node scripts/rg.mjs search --repo <git-root> --mode fast --query <bounded request>
 node scripts/rg.mjs search --repo <git-root> --mode deep --query <bounded request>
+node scripts/rg.mjs status --run-id <run-id>
+node scripts/rg.mjs status --receipt <absolute-receipt-path>
 node scripts/rg.mjs doctor --repo <git-root>
 ```
 
@@ -74,7 +76,7 @@ node scripts/rg.mjs doctor --repo <git-root>
 - `fast`: one Luna pass.
 - `deep`: one explicitly requested Terra pass.
 
-An `auto` search can take longer than a shell tool's initial wait window. A returned live `session_id` is an in-progress command, not a failed search: keep polling that same session until the process exits and emits the final `rg.run.v1` JSON. The `RG: starting ...` and `RG: completed ...` lines are progress only.
+An `auto` search can take longer than any number of shell-tool wait windows. A returned live `session_id` is an in-progress command, not a failed search: keep polling that same session until the process exits and emits the final `rg.run.v1` JSON. `RG_PROGRESS` heartbeats expose the current `run_id`. If the session handle is lost, use `status`; only its terminal `failed` state permits targeted fallback. The progress lines are not final results.
 
 Configuration precedence and the immutable routing constraints are documented in [references/configuration.md](references/configuration.md).
 

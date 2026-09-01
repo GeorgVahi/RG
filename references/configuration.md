@@ -26,7 +26,7 @@ Profile overrides may change only the exact model, reasoning effort, and user-fa
 - `fast` is one Luna/low step.
 - `deep` is one Terra/medium step.
 - Transport failure is always `block`; it never selects another model.
-- The only fallback is disclosed minimum targeted root search by the parent agent.
+- The only fallback is disclosed minimum targeted root search by the parent agent after a terminal RG failure. Poll counts and caller-side wait windows are never failure signals.
 - Every Codex child is subscription-authenticated, read-only, ephemeral, and launched with explicit model and reasoning arguments.
 - Every Codex child disables the RG skill only in its own process configuration so global `$rg` routing cannot recurse inside the already-delegated scout.
 
@@ -56,11 +56,13 @@ The diagnostic contains public before/after fingerprint metadata plus added, rem
 
 ## Run-store lifecycle
 
-An active route step writes a schema- and run-ID-bound `active.json` next to its `running` receipt and refreshes the lease every 30 seconds. Normal completion or failure removes the lease. A future filesystem mtime never establishes freshness by itself: only a fully valid lease for the same run with a live PID can still prove that the owner is active. Malformed or mismatched leases cannot borrow a live PID to mask another stale run. A finalizer converts any otherwise-unhandled in-process error into a terminal failed receipt; if a result artifact already exists it is recorded as `unvalidated` rather than silently lost.
+An active route step writes a schema- and run-ID-bound `active.json` next to its `running` receipt and refreshes the lease every 30 seconds. The CLI also emits `rg.progress.v1` immediately and at each heartbeat with the run ID, elapsed time, `terminal: false`, `fallback_allowed: false`, and `polling_windows_affect_state: false`. Normal completion or failure removes the lease. A future filesystem mtime never establishes freshness by itself: only a fully valid lease for the same run with a live PID can still prove that the owner is active. Malformed or mismatched leases cannot borrow a live PID to mask another stale run. A finalizer converts any otherwise-unhandled in-process error into a terminal failed receipt; if a result artifact already exists it is recorded as `unvalidated` rather than silently lost.
 
 Before a search, maintenance requires the resolved `$CODEX_HOME`, its `rg` child, and `rg/runs` to be real, nonlinked directories, then inspects only child directories whose name and `receipt.json` match RG's run-id, receipt, and non-future lifecycle contracts. A linked/junctioned component fails closed without scanning or deleting its target. Each route step independently rechecks this boundary, creates its run directory without recursive parent creation, and revalidates both the boundary and run identity before artifact mutations. A `running` receipt older than two hours is reconciled to `failed/stale-run-reconciled` only when there is neither a recent valid heartbeat nor a live valid owner. Cleanup recursively removes only revalidated terminal run directories inside the exact runs root, after rechecking the full boundary and child filesystem identities. Per-run atomic maintenance claims ensure concurrent reconcilers/deleters have one owner and deletion counters reflect completed claims, while dead owners can be recovered. Terminal runs older than 14 days are eligible; after a 24-hour grace period, terminal runs beyond the newest 200 are also eligible. Symlinks/junctions, unknown names, malformed receipts, active runs, and recent runs are preserved.
 
 `search` performs maintenance and includes `run_store_maintenance` in `rg.run.v1`. `doctor` is non-mutating and exposes the same inventory as `run_store`, including scanned/status counts, active leases, actionable stale receipts, cleanup eligibility, reconciliations, deletions, and invalid entries.
+
+`status --run-id <id>` and `status --receipt <path>` are read-only, exact-target lifecycle queries. They return `rg.status.v1` with one of `running_active`, `running_unowned`, `running_stale`, `completed`, `failed`, `invalid`, or `not_found`. All running states are nonterminal. `invalid` and `not_found` fail closed. Only `failed` returns both `terminal: true` and `fallback_allowed: true`; `completed` is terminal but directs the caller to consume the original result instead of falling back.
 
 ## Reliability gate and canary
 

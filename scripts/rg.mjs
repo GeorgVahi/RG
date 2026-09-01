@@ -17,6 +17,8 @@ const RESULT_SCHEMA = "rg.discovery.v1";
 const RUN_SCHEMA = "rg.run.v1";
 const RECEIPT_SCHEMA = "rg.receipt.v1";
 const ACTIVE_SCHEMA = "rg.active.v1";
+const STATUS_SCHEMA = "rg.status.v1";
+const PROGRESS_SCHEMA = "rg.progress.v1";
 const INVENTORY = "git-tracked-untracked-nonignored-v1";
 const INSTRUCTIONS_ID = "rg-scout-v1";
 const PROFILE_NAMES = new Set(["rg_search_fast", "rg_search_balanced"]);
@@ -1699,6 +1701,14 @@ function isStrictDescendant(parent, candidate) {
   return relative.length > 0 && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
 }
 
+function sameFilesystemPath(left, right) {
+  const resolvedLeft = path.resolve(left);
+  const resolvedRight = path.resolve(right);
+  return process.platform === "win32"
+    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+    : resolvedLeft === resolvedRight;
+}
+
 function assertRunStoreOutsideRepo(repo, home) {
   const root = path.resolve(repo);
   const runsRoot = path.resolve(home, "rg", "runs");
@@ -1825,6 +1835,18 @@ function receiptLifecycleTimes(receipt, nowMs) {
   return { startedMs, completedMs };
 }
 
+function runningProgress(runId, startedMs, nowMs = Date.now()) {
+  return {
+    schema: PROGRESS_SCHEMA,
+    state: "running",
+    run_id: runId,
+    terminal: false,
+    fallback_allowed: false,
+    polling_windows_affect_state: false,
+    elapsed_ms: Math.max(0, nowMs - startedMs),
+  };
+}
+
 function processIsAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -1862,8 +1884,18 @@ async function activeRunLease(runDir, runId, nowMs) {
   return processIsAlive(lease.pid);
 }
 
-async function startRunLease(runDir, runId, assertBoundary = async () => {}) {
+async function startRunLease(
+  runDir,
+  runId,
+  assertBoundary = async () => {},
+  options = {},
+) {
   const activeFile = path.join(runDir, "active.json");
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? RUN_HEARTBEAT_INTERVAL_MS;
+  const onHeartbeat = options.onHeartbeat;
+  if (!Number.isFinite(heartbeatIntervalMs) || heartbeatIntervalMs <= 0) {
+    throw new RGError("heartbeat interval must be positive", "invalid-arguments");
+  }
   await assertBoundary();
   await atomicWriteJson(activeFile, {
     schema: ACTIVE_SCHEMA,
@@ -1877,8 +1909,11 @@ async function startRunLease(runDir, runId, assertBoundary = async () => {}) {
     const now = new Date();
     void assertBoundary()
       .then(() => fsp.utimes(activeFile, now, now))
+      .then(() => {
+        if (typeof onHeartbeat === "function") onHeartbeat(now.getTime());
+      })
       .catch(() => {});
-  }, RUN_HEARTBEAT_INTERVAL_MS);
+  }, heartbeatIntervalMs);
   timer.unref?.();
   return {
     async stop() {
@@ -1891,6 +1926,208 @@ async function startRunLease(runDir, runId, assertBoundary = async () => {}) {
       });
     },
   };
+}
+
+function runStatusResult({
+  runId,
+  receiptPath = null,
+  receipt = null,
+  state,
+  terminal = false,
+  fallbackAllowed = false,
+  action,
+  activeLease = false,
+  elapsedMs = null,
+}) {
+  return {
+    schema: STATUS_SCHEMA,
+    state,
+    run_id: runId,
+    terminal,
+    fallback_allowed: fallbackAllowed,
+    polling_windows_affect_state: false,
+    action,
+    active_lease: activeLease,
+    heartbeat_interval_ms: RUN_HEARTBEAT_INTERVAL_MS,
+    stale_after_ms: STALE_RUN_MS,
+    elapsed_ms: elapsedMs,
+    receipt_path: receiptPath,
+    receipt,
+  };
+}
+
+function statusFailureResult(error) {
+  const code = error instanceof RGError ? error.code : "unexpected-error";
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    ...runStatusResult({
+      runId: null,
+      state: "invalid",
+      action: "report-status-contract-error",
+    }),
+    failure_reason: code,
+    message,
+  };
+}
+
+async function inspectRunStatus({
+  home = codexHome(),
+  runId,
+  receipt: requestedReceipt,
+  nowMs = Date.now(),
+} = {}) {
+  const selectors = [runId, requestedReceipt].filter(
+    (value) => typeof value === "string" && value.trim().length > 0,
+  );
+  if (selectors.length !== 1) {
+    throw new RGError("status requires exactly one of --run-id or --receipt", "invalid-arguments");
+  }
+
+  const boundary = await runStoreBoundary(home, false);
+  let selectedRunId = typeof runId === "string" ? runId.trim() : null;
+  let selectedReceipt = null;
+  if (typeof requestedReceipt === "string" && requestedReceipt.trim()) {
+    selectedReceipt = path.resolve(requestedReceipt.trim());
+    if (path.basename(selectedReceipt) !== "receipt.json") {
+      throw new RGError("status receipt must name receipt.json", "invalid-arguments");
+    }
+    selectedRunId = path.basename(path.dirname(selectedReceipt));
+  }
+  if (!RUN_ID_PATTERN.test(selectedRunId ?? "")) {
+    throw new RGError("status run id does not match the run-store contract", "invalid-arguments");
+  }
+
+  if (!boundary) {
+    return runStatusResult({
+      runId: selectedRunId,
+      state: "not_found",
+      action: "verify-run-id-or-receipt",
+    });
+  }
+  const runDirectory = path.join(boundary.runsRoot, selectedRunId);
+  const receiptPath = path.join(runDirectory, "receipt.json");
+  if (selectedReceipt && !sameFilesystemPath(selectedReceipt, receiptPath)) {
+    throw new RGError("status receipt is outside the RG run store", "invalid-arguments");
+  }
+  if (
+    !isStrictDescendant(boundary.runsRoot, runDirectory) ||
+    path.basename(runDirectory) !== selectedRunId
+  ) {
+    throw new RGError("status target is outside the RG run store", "run-store-invalid");
+  }
+
+  const runInfo = await fsp.lstat(runDirectory).catch(() => null);
+  if (!runInfo) {
+    return runStatusResult({
+      runId: selectedRunId,
+      receiptPath,
+      state: "not_found",
+      action: "verify-run-id-or-receipt",
+    });
+  }
+  if (!runInfo.isDirectory() || runInfo.isSymbolicLink()) {
+    return runStatusResult({
+      runId: selectedRunId,
+      receiptPath,
+      state: "invalid",
+      action: "report-status-contract-error",
+    });
+  }
+
+  const receiptInfo = await fsp.lstat(receiptPath).catch(() => null);
+  if (!receiptInfo) {
+    return runStatusResult({
+      runId: selectedRunId,
+      receiptPath,
+      state: "not_found",
+      action: "verify-run-id-or-receipt",
+    });
+  }
+  if (!receiptInfo.isFile() || receiptInfo.isSymbolicLink()) {
+    return runStatusResult({
+      runId: selectedRunId,
+      receiptPath,
+      state: "invalid",
+      action: "report-status-contract-error",
+    });
+  }
+
+  const receipt = await readRunReceipt(receiptPath);
+  const lifecycle = receiptLifecycleTimes(receipt, nowMs);
+  if (
+    receipt?.schema !== RECEIPT_SCHEMA ||
+    receipt.run_id !== selectedRunId ||
+    !["running", "completed", "failed"].includes(receipt.status) ||
+    lifecycle === null ||
+    !(await runStoreBoundaryMatches(boundary))
+  ) {
+    return runStatusResult({
+      runId: selectedRunId,
+      receiptPath,
+      receipt,
+      state: "invalid",
+      action: "report-status-contract-error",
+    });
+  }
+
+  const elapsedMs =
+    lifecycle.completedMs === null
+      ? nowMs - lifecycle.startedMs
+      : lifecycle.completedMs - lifecycle.startedMs;
+  if (receipt.status === "running") {
+    const active = await activeRunLease(runDirectory, selectedRunId, nowMs);
+    const state = active
+      ? "running_active"
+      : elapsedMs > STALE_RUN_MS
+        ? "running_stale"
+        : "running_unowned";
+    return runStatusResult({
+      runId: selectedRunId,
+      receiptPath,
+      receipt,
+      state,
+      action: active ? "wait" : "check-original-session",
+      activeLease: active,
+      elapsedMs,
+    });
+  }
+
+  if (receipt.status === "completed") {
+    if (
+      receipt.result_evidence !== "valid" ||
+      receipt.terminal_event !== "turn.completed" ||
+      receipt.codex_exit_code !== 0
+    ) {
+      return runStatusResult({
+        runId: selectedRunId,
+        receiptPath,
+        receipt,
+        state: "invalid",
+        action: "report-status-contract-error",
+        elapsedMs,
+      });
+    }
+    return runStatusResult({
+      runId: selectedRunId,
+      receiptPath,
+      receipt,
+      state: "completed",
+      terminal: true,
+      action: "consume-result",
+      elapsedMs,
+    });
+  }
+
+  return runStatusResult({
+    runId: selectedRunId,
+    receiptPath,
+    receipt,
+    state: "failed",
+    terminal: true,
+    fallbackAllowed: true,
+    action: "minimum-targeted-recovery",
+    elapsedMs,
+  });
 }
 
 async function finalizeReceiptIfRunning(
@@ -2163,7 +2400,12 @@ async function maintainRunStore(home = codexHome(), options = {}) {
       ) {
         continue;
       }
-      await fsp.rm(record.runDir, { recursive: true, force: false });
+      await fsp.rm(record.runDir, {
+        recursive: true,
+        force: false,
+        maxRetries: process.platform === "win32" ? 3 : 0,
+        retryDelay: 50,
+      });
       record.deleted = true;
       report.deleted += 1;
     } finally {
@@ -2561,11 +2803,18 @@ async function runProfile({
 
   let lease;
   try {
-  lease = await startRunLease(runDir, runId, assertBoundary);
+  const startedMs = Date.parse(startedAt);
+  const emitRunningProgress = (nowMs = Date.now()) => {
+    process.stderr.write(`RG_PROGRESS ${JSON.stringify(runningProgress(runId, startedMs, nowMs))}\n`);
+  };
+  lease = await startRunLease(runDir, runId, assertBoundary, {
+    onHeartbeat: emitRunningProgress,
+  });
   process.stderr.write(
-    `RG: starting ${profile.name} (${profile.model}/${profile.model_reasoning_effort}); ` +
+    `RG: starting ${profile.name} (${profile.model}/${profile.model_reasoning_effort}); run_id=${runId}; ` +
       "still running; wait for final rg.run.v1\n",
   );
+  emitRunningProgress();
   const environment = scrubEnvironment(process.env);
   let outcome;
   try {
@@ -3029,6 +3278,7 @@ function help() {
 
 Usage:
   node scripts/rg.mjs search --repo <path> --query <request> [--mode auto|fast|deep] [--timeout <seconds>]
+  node scripts/rg.mjs status (--run-id <id> | --receipt <path>)
   node scripts/rg.mjs doctor --repo <path>
   node scripts/rg.mjs resolve --repo <path> [--mode auto|fast|deep]
 `;
@@ -3051,6 +3301,14 @@ async function main(argv = process.argv.slice(2)) {
       mode,
       codexBin,
       timeoutMs,
+    });
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  if (command === "status") {
+    const result = await inspectRunStatus({
+      runId: typeof options.run_id === "string" ? options.run_id : undefined,
+      receipt: typeof options.receipt === "string" ? options.receipt : undefined,
     });
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return;
@@ -3094,15 +3352,18 @@ export {
   extractTriggers,
   failureResult,
   fingerprintDriftError,
+  inspectRunStatus,
   maintainRunStore,
   performSearch,
   readAndValidateResult,
   developerInstructions,
   rgSkillDisablePaths,
   sameModelRepairDecision,
+  runningProgress,
   resolveGitRoot,
   resolveRoute,
   scrubEnvironment,
+  startRunLease,
   validateModelMap,
   validateProfile,
   validateResultObject,
@@ -3112,7 +3373,8 @@ export {
 const invoked = isMainModule();
 if (invoked) {
   main().catch((error) => {
-    process.stdout.write(`${JSON.stringify(failureResult(error), null, 2)}\n`);
+    const result = process.argv[2] === "status" ? statusFailureResult(error) : failureResult(error);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     process.exitCode = 1;
   });
 }

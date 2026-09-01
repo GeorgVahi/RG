@@ -41,13 +41,24 @@ Use `--mode fast` only when the request explicitly prefers the cheapest single L
 
 Keep the request bounded and outcome-oriented. Include the symbols, behavior, suspected area, or evidence needed, but do not paste unrelated chat history.
 
-The route may outlive the shell tool's initial wait window. If the invocation returns a live `session_id` or `cell_id` without a terminal `exit_code`, the runner is still working: continue the same process with the tool's `write_stdin` or `wait` mechanism until it exits. Lines such as `RG: starting ...` and `RG: completed ...` are progress messages, not the structured result and not a failure. Never start fallback recovery while that process is live.
+The route may outlive any number of shell-tool wait windows. If the invocation returns a live `session_id` or `cell_id` without a terminal `exit_code`, the runner is still working: continue the same process with the tool's `write_stdin` or `wait` mechanism until it exits. A polling-window count or caller-side wall-clock window never changes `RUNNING` into failure. In particular, never conclude that the scout failed merely because two or more waits returned no final packet.
+
+Each route step immediately emits an `RG_PROGRESS` object with schema `rg.progress.v1` and refreshes it every 30 seconds while the worker is live. It includes `run_id`, `terminal: false`, `fallback_allowed: false`, and `polling_windows_affect_state: false`. Lines such as `RG: starting ...`, `RG_PROGRESS ...`, and `RG: completed ...` are progress messages, not the structured result and not a failure.
+
+If the original shell session handle is unavailable, inspect the receipt without starting another scout:
+
+```text
+node <rg-skill-root>/scripts/rg.mjs status --run-id <run_id>
+node <rg-skill-root>/scripts/rg.mjs status --receipt <absolute-receipt-path>
+```
+
+The machine-readable `rg.status.v1` result is authoritative for receipt-backed recovery. `running_active`, `running_unowned`, and `running_stale` are nonterminal and forbid fallback. `completed` means consume the original result. Only `failed` with both `terminal: true` and `fallback_allowed: true` permits minimum targeted recovery. `invalid` and `not_found` fail closed: report the lifecycle/status problem instead of reclassifying a polling delay as scout failure.
 
 ## Consume the result
 
 Accept the result only when the runner returns `schema: "rg.run.v1"` and `status` is `completed` or `completed_with_gaps`. The nested `result` has the strict `rg.discovery.v1` evidence contract.
 
-Classify the runner as failed only after the process has exited or otherwise reached a terminal state without a valid result. Parse the accumulated output through the final `rg.run.v1` object; do not judge an in-progress output chunk in isolation.
+Classify the runner as failed only after the process has exited or otherwise reached a terminal state without a valid result, or after `rg.status.v1` explicitly reports terminal `failed` with fallback allowed. Parse the accumulated output through the final `rg.run.v1` object; do not judge an in-progress output chunk in isolation. Never start fallback recovery while the original process or receipt state is nonterminal.
 
 - Use its owners, tests, couplings, flows, constraints, and uncertainties as a map.
 - Verify material conclusions with targeted reads of returned `path:line` ranges.

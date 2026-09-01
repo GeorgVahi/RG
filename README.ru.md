@@ -26,7 +26,7 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.codex\skills\rg" -Target "C
 ```md
 ## Default repository search
 
-- Before non-trivial repository grep, file/symbol/owner/test discovery, dependency tracing, or cross-file evidence gathering, use the installed $rg skill. Direct reads remain appropriate for an explicit or already-known path and for Git metadata.
+- Before non-trivial repository grep, file/symbol/owner/test discovery, dependency tracing, or cross-file evidence gathering, use the installed $rg skill. Direct reads remain appropriate for an explicit or already-known path and for Git metadata. A live RG `session_id`/`cell_id` remains running regardless of the polling-window count; wait on the same process and allow targeted fallback only after a terminal failure or `rg.status.v1` with `terminal: true` and `fallback_allowed: true`.
 ```
 
 ## Использование
@@ -37,12 +37,16 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.codex\skills\rg" -Target "C
 node scripts/rg.mjs search --repo <git-root> --mode auto --query <запрос>
 node scripts/rg.mjs search --repo <git-root> --mode fast --query <запрос>
 node scripts/rg.mjs search --repo <git-root> --mode deep --query <запрос>
+node scripts/rg.mjs status --run-id <run-id>
+node scripts/rg.mjs status --receipt <абсолютный-путь-к-receipt.json>
 node scripts/rg.mjs doctor --repo <git-root>
 ```
 
 - `auto`: сначала Luna, затем Terra только по валидному evidence-trigger.
 - `fast`: один проход Luna.
 - `deep`: один явно запрошенный проход Terra.
+
+Количество окон ожидания никогда не означает отказ RG. Пока исходный процесс жив, нужно продолжать опрашивать тот же `session_id`/`cell_id`. `RG_PROGRESS` сообщает `run_id` сразу и затем каждые 30 секунд. Если handle исходной сессии потерян, команда `status` читает receipt без запуска нового скаута. Только состояние `failed` с `terminal: true` и `fallback_allowed: true` разрешает минимальный targeted fallback; все `running_*`, а также `invalid` и `not_found`, запрещают его.
 
 Проверка:
 

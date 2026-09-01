@@ -35,7 +35,14 @@ const description = /^description:\s*(.+)$/m.exec(frontmatter[1])?.[1]?.trim();
 if (!description || description.length > 1024) {
   throw new Error("skill description must be present and at most 1024 characters");
 }
-for (const requiredInstruction of ["`session_id`", "`write_stdin`", "terminal `exit_code`", "final `rg.run.v1`"]) {
+for (const requiredInstruction of [
+  "`session_id`",
+  "`write_stdin`",
+  "terminal `exit_code`",
+  "final `rg.run.v1`",
+  "`rg.status.v1`",
+  "`fallback_allowed: true`",
+]) {
   if (!skill.includes(requiredInstruction)) {
     throw new Error(`SKILL.md must retain live-session handling instruction: ${requiredInstruction}`);
   }
@@ -44,6 +51,16 @@ for (const requiredInstruction of ["`session_id`", "`write_stdin`", "terminal `e
 const runner = await fs.readFile(path.join(root, "scripts", "rg.mjs"), "utf8");
 if (!runner.includes("still running; wait for final rg.run.v1")) {
   throw new Error("scripts/rg.mjs must retain the live-session progress hint");
+}
+for (const requiredRunnerToken of [
+  'const STATUS_SCHEMA = "rg.status.v1"',
+  'const PROGRESS_SCHEMA = "rg.progress.v1"',
+  "polling_windows_affect_state: false",
+  'fallbackAllowed: true',
+]) {
+  if (!runner.includes(requiredRunnerToken)) {
+    throw new Error(`scripts/rg.mjs must retain terminal-only status behavior: ${requiredRunnerToken}`);
+  }
 }
 
 const openai = await fs.readFile(path.join(root, "agents", "openai.yaml"), "utf8");

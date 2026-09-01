@@ -19,11 +19,14 @@ import {
   extractTriggers,
   failureResult,
   fingerprintDriftError,
+  inspectRunStatus,
   maintainRunStore,
   readAndValidateResult,
   rgSkillDisablePaths,
+  runningProgress,
   sameModelRepairDecision,
   scrubEnvironment,
+  startRunLease,
   validateModelMap,
   validateProfile,
   validateResultObject,
@@ -166,6 +169,207 @@ test("run artifacts cannot become self-induced repository drift", () => {
   assert.doesNotThrow(() =>
     assertRunStoreOutsideRepo(repo, path.resolve("C:/bounded/codex-home")),
   );
+});
+
+test("run status never turns polling windows into failure and only permits fallback for terminal failure", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "rg-test-status-"));
+  const nowMs = Date.now();
+  const runsRoot = path.join(home, "rg", "runs");
+  const ids = {
+    active: "20200101000000000-rg_search_fast-aaaaaaaaaaaa",
+    completed: "20200101000000001-rg_search_fast-bbbbbbbbbbbb",
+    failed: "20200101000000002-rg_search_fast-cccccccccccc",
+    stale: "20200101000000003-rg_search_fast-dddddddddddd",
+    invalid: "20200101000000004-rg_search_fast-eeeeeeeeeeee",
+    missing: "20200101000000005-rg_search_fast-ffffffffffff",
+  };
+  const writeRun = async (runId, receipt) => {
+    const runDirectory = path.join(runsRoot, runId);
+    await fs.mkdir(runDirectory, { recursive: true });
+    const receiptPath = path.join(runDirectory, "receipt.json");
+    await fs.writeFile(
+      receiptPath,
+      `${JSON.stringify({ schema: "rg.receipt.v1", run_id: runId, ...receipt })}\n`,
+    );
+    return { runDirectory, receiptPath };
+  };
+
+  try {
+    const active = await writeRun(ids.active, {
+      status: "running",
+      started_at: new Date(nowMs - 3 * 60 * 60 * 1000).toISOString(),
+      completed_at: null,
+      result_evidence: "missing",
+    });
+    await fs.writeFile(
+      path.join(active.runDirectory, "active.json"),
+      `${JSON.stringify({
+        schema: "rg.active.v1",
+        run_id: ids.active,
+        pid: process.pid,
+        started_at: new Date(nowMs - 3 * 60 * 60 * 1000).toISOString(),
+      })}\n`,
+    );
+    await writeRun(ids.completed, {
+      status: "completed",
+      started_at: new Date(nowMs - 2 * 60 * 1000).toISOString(),
+      completed_at: new Date(nowMs - 60 * 1000).toISOString(),
+      terminal_event: "turn.completed",
+      codex_exit_code: 0,
+      result_evidence: "valid",
+    });
+    await writeRun(ids.failed, {
+      status: "failed",
+      started_at: new Date(nowMs - 2 * 60 * 1000).toISOString(),
+      completed_at: new Date(nowMs - 60 * 1000).toISOString(),
+      failure_reason: "runner-failed",
+    });
+    await writeRun(ids.stale, {
+      status: "running",
+      started_at: new Date(nowMs - 3 * 60 * 60 * 1000).toISOString(),
+      completed_at: null,
+    });
+    await writeRun(ids.invalid, {
+      status: "completed",
+      started_at: new Date(nowMs - 2 * 60 * 1000).toISOString(),
+      completed_at: new Date(nowMs - 60 * 1000).toISOString(),
+      terminal_event: "turn.completed",
+      codex_exit_code: 0,
+      result_evidence: "missing",
+    });
+
+    for (let pollingWindow = 0; pollingWindow < 3; pollingWindow += 1) {
+      const status = await inspectRunStatus({
+        home,
+        runId: ids.active,
+        nowMs: nowMs + pollingWindow * 30_000,
+      });
+      assert.equal(status.schema, "rg.status.v1");
+      assert.equal(status.state, "running_active");
+      assert.equal(status.terminal, false);
+      assert.equal(status.fallback_allowed, false);
+      assert.equal(status.polling_windows_affect_state, false);
+      assert.equal(status.action, "wait");
+    }
+
+    const byReceipt = await inspectRunStatus({ home, receipt: active.receiptPath, nowMs });
+    assert.equal(byReceipt.state, "running_active");
+
+    const completed = await inspectRunStatus({ home, runId: ids.completed, nowMs });
+    assert.equal(completed.state, "completed");
+    assert.equal(completed.terminal, true);
+    assert.equal(completed.fallback_allowed, false);
+    assert.equal(completed.action, "consume-result");
+    assert.equal(completed.elapsed_ms, 60_000);
+
+    const failed = await inspectRunStatus({ home, runId: ids.failed, nowMs });
+    assert.equal(failed.state, "failed");
+    assert.equal(failed.terminal, true);
+    assert.equal(failed.fallback_allowed, true);
+    assert.equal(failed.action, "minimum-targeted-recovery");
+    assert.equal(failed.elapsed_ms, 60_000);
+
+    const stale = await inspectRunStatus({ home, runId: ids.stale, nowMs });
+    assert.equal(stale.state, "running_stale");
+    assert.equal(stale.terminal, false);
+    assert.equal(stale.fallback_allowed, false);
+
+    const invalid = await inspectRunStatus({ home, runId: ids.invalid, nowMs });
+    assert.equal(invalid.state, "invalid");
+    assert.equal(invalid.fallback_allowed, false);
+
+    const missing = await inspectRunStatus({ home, runId: ids.missing, nowMs });
+    assert.equal(missing.state, "not_found");
+    assert.equal(missing.fallback_allowed, false);
+
+    const cli = spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL("../scripts/rg.mjs", import.meta.url)), "status", "--run-id", ids.active],
+      {
+        encoding: "utf8",
+        env: { ...process.env, CODEX_HOME: home },
+        windowsHide: true,
+      },
+    );
+    assert.equal(cli.status, 0, cli.stderr);
+    const cliStatus = JSON.parse(cli.stdout);
+    assert.equal(cliStatus.schema, "rg.status.v1");
+    assert.equal(cliStatus.state, "running_active");
+    assert.equal(cliStatus.fallback_allowed, false);
+
+    const invalidCli = spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL("../scripts/rg.mjs", import.meta.url)), "status", "--run-id", "bad"],
+      {
+        encoding: "utf8",
+        env: { ...process.env, CODEX_HOME: home },
+        windowsHide: true,
+      },
+    );
+    assert.equal(invalidCli.status, 1);
+    const invalidCliStatus = JSON.parse(invalidCli.stdout);
+    assert.equal(invalidCliStatus.schema, "rg.status.v1");
+    assert.equal(invalidCliStatus.state, "invalid");
+    assert.equal(invalidCliStatus.terminal, false);
+    assert.equal(invalidCliStatus.fallback_allowed, false);
+
+    await assert.rejects(
+      inspectRunStatus({ home, runId: ids.active, receipt: active.receiptPath, nowMs }),
+      (error) => error instanceof RGError && error.code === "invalid-arguments",
+    );
+    await assert.rejects(
+      inspectRunStatus({ home, receipt: path.join(home, "outside", ids.active, "receipt.json"), nowMs }),
+      (error) => error instanceof RGError && error.code === "invalid-arguments",
+    );
+  } finally {
+    await dispose(home);
+  }
+});
+
+test("run lease emits machine-readable nonterminal heartbeat progress", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "rg-test-heartbeat-"));
+  const runId = "20200101000000000-rg_search_fast-aaaaaaaaaaaa";
+  const runDirectory = path.join(home, runId);
+  await fs.mkdir(runDirectory);
+  let resolveHeartbeat;
+  const heartbeat = new Promise((resolve) => {
+    resolveHeartbeat = resolve;
+  });
+  let lease;
+  try {
+    const startedMs = Date.now();
+    lease = await startRunLease(runDirectory, runId, async () => {}, {
+      heartbeatIntervalMs: 10,
+      onHeartbeat: (nowMs) => resolveHeartbeat(runningProgress(runId, startedMs, nowMs)),
+    });
+    const progress = await Promise.race([
+      heartbeat,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("heartbeat timeout")), 1000)),
+    ]);
+    assert.deepEqual(
+      {
+        schema: progress.schema,
+        state: progress.state,
+        run_id: progress.run_id,
+        terminal: progress.terminal,
+        fallback_allowed: progress.fallback_allowed,
+        polling_windows_affect_state: progress.polling_windows_affect_state,
+      },
+      {
+        schema: "rg.progress.v1",
+        state: "running",
+        run_id: runId,
+        terminal: false,
+        fallback_allowed: false,
+        polling_windows_affect_state: false,
+      },
+    );
+    assert.equal((await fs.stat(path.join(runDirectory, "active.json"))).isFile(), true);
+  } finally {
+    if (lease) await lease.stop();
+    await assert.rejects(fs.stat(path.join(runDirectory, "active.json")), { code: "ENOENT" });
+    await dispose(home);
+  }
 });
 
 test("run-store maintenance reconciles stale receipts and deletes only eligible terminal runs", async () => {
