@@ -1710,23 +1710,10 @@ function assertRunStoreOutsideRepo(repo, home) {
   }
 }
 
-function sameFilesystemPath(left, right) {
-  const normalize = (value) => {
-    let resolved = path.resolve(value);
-    if (process.platform === "win32") {
-      if (resolved.startsWith("\\\\?\\")) resolved = resolved.slice(4);
-      resolved = resolved.toLowerCase();
-    }
-    return resolved;
-  };
-  return normalize(left) === normalize(right);
-}
-
 async function safeDirectoryInfo(directory) {
   const info = await fsp.lstat(directory).catch(() => null);
   if (!info?.isDirectory() || info.isSymbolicLink()) return null;
-  const canonical = await fsp.realpath(directory).catch(() => null);
-  return canonical && sameFilesystemPath(canonical, directory) ? info : null;
+  return info;
 }
 
 async function runStoreBoundary(home, mutate) {
