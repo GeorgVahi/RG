@@ -20,11 +20,13 @@ Higher-priority files must validate completely. RG never merges an incomplete ov
 
 Profile overrides may change only the exact model, reasoning effort, and user-facing description. The profile name, `read-only` sandbox, and `rg-scout-v1` instruction contract remain fixed.
 
+Version 0.4.0 defaults to `gpt-6-luna`/`low` and `gpt-6-sol`/`medium`. Sol fills the balanced tier previously assigned to GPT-5.6 Terra; see the [GPT-6 model catalog](https://developers.openai.com/api/docs/models). Existing repo and user overrides remain authoritative, including GPT-5.6 pins. Update or remove those overrides deliberately to adopt the new defaults. RG never rewrites them or substitutes models after a failed call.
+
 ## Route invariants
 
-- `auto` is Luna/low followed by Terra/medium only after valid semantic evidence reports a configured trigger.
+- `auto` is Luna/low followed by Sol/medium only after valid semantic evidence reports a configured trigger.
 - `fast` is one Luna/low step.
-- `deep` is one Terra/medium step.
+- `deep` is one Sol/medium step.
 - Transport failure is always `block`; it never selects another model.
 - The only fallback is disclosed minimum targeted root search by the parent agent after a terminal RG failure. Poll counts and caller-side wait windows are never failure signals.
 - Every Codex child is subscription-authenticated, read-only, ephemeral, and launched with explicit model and reasoning arguments.
@@ -34,7 +36,7 @@ Profile overrides may change only the exact model, reasoning effort, and user-fa
 
 Failed result validation emits a bounded, machine-readable `validation_errors` array in both the CLI `rg.run.v1` failure and `receipt.json`. Entries contain `category`, `field`, and `message`; `rejected_value` is present only for a safe repository-relative path. `validation_error_count` records the total and `validation_errors_truncated` reports whether the 128-entry output limit was reached. Current categories are `unsafe-path`, `path-outside-inventory`, `ignored-content`, `linked-path`, `invalid-line-range`, `line-range-no-overlap`, `invalid-fields`, `fingerprint-mismatch`, and `malformed-result`.
 
-The validator checks every evidence group before rejecting the artifact. It applies line-range normalization only after the complete result passes, and it never rewrites the raw `result.json`. An `invalid-result` remains a contract/transport-class stop and cannot trigger Terra.
+The validator checks every evidence group before rejecting the artifact. It applies line-range normalization only after the complete result passes, and it never rewrites the raw `result.json`. An `invalid-result` remains a contract/transport-class stop and cannot trigger Sol.
 
 ## Path provenance and preflight
 
@@ -46,13 +48,13 @@ For a safe path outside the inventory, RG can report up to five same-basename ca
 
 RG permits at most one repair attempt per route step, using the exact same configured profile, model, reasoning effort, subscription provider, read-only sandbox, owner fingerprint, and strict result validator. Repair is eligible only when every diagnostic is one of `path-outside-inventory`, `invalid-line-range`, `line-range-no-overlap`, or `invalid-fields`. It is skipped for more than 20 diagnostics, truncated diagnostics, a repair prompt over 192 KiB, or any unsafe/ignored/linked/fingerprint/malformed/mixed failure. The repair timeout is capped at five minutes.
 
-The original `result.json` remains untouched; repair uses separate `repair-prompt.txt`, `repair-events.jsonl`, `repair-stderr.log`, and `repair-result.json` artifacts. Receipt and CLI output disclose whether repair was attempted and its outcome. Evidence state is derived from the artifact: a non-empty result that could not reach strict validation is `unvalidated`, a contract-rejected result is `invalid`, and only an absent/empty result is `missing`. A second invalid result or repair transport failure is terminal. Repair never changes model tier and cannot act as a Terra fallback; only a subsequently valid semantic trigger can continue an `auto` route.
+The original `result.json` remains untouched; repair uses separate `repair-prompt.txt`, `repair-events.jsonl`, `repair-stderr.log`, and `repair-result.json` artifacts. Receipt and CLI output disclose whether repair was attempted and its outcome. Evidence state is derived from the artifact: a non-empty result that could not reach strict validation is `unvalidated`, a contract-rejected result is `invalid`, and only an absent/empty result is `missing`. A second invalid result or repair transport failure is terminal. Repair never changes model tier and cannot act as a Sol fallback; only a subsequently valid semantic trigger can continue an `auto` route.
 
 ## Worktree drift restart
 
 RG distinguishes an owner-observed repository change (`fingerprint-drift`) from a model-returned fingerprint mismatch (`invalid-result` / `fingerprint-mismatch`). Only the former is restartable, and only when it carries an internally validated `rg.fingerprint-drift.v1` diagnostic from an allowed phase: inventory recheck, before a later route step, during search, or immediately before/during same-model repair.
 
-The diagnostic contains public before/after fingerprint metadata plus added, removed, modified, and type-changed counts. Its path sample contains at most 20 safe repository-relative paths and reports truncation; it never includes file contents. RG discards the full in-progress route attempt and restarts once from the route's first configured profile with a fresh owner snapshot. Completed and failed receipts from the discarded attempt remain available in `restart.discarded_steps`. The successful response reports `restart.outcome: completed`; another drift reports `exhausted`. Any other failure on the restarted attempt reports `failed` and is terminal. The attempt limit is immutable at one, and a restart cannot select Terra unless a fresh valid Luna result independently emits a configured semantic trigger.
+The diagnostic contains public before/after fingerprint metadata plus added, removed, modified, and type-changed counts. Its path sample contains at most 20 safe repository-relative paths and reports truncation; it never includes file contents. RG discards the full in-progress route attempt and restarts once from the route's first configured profile with a fresh owner snapshot. Completed and failed receipts from the discarded attempt remain available in `restart.discarded_steps`. The successful response reports `restart.outcome: completed`; another drift reports `exhausted`. Any other failure on the restarted attempt reports `failed` and is terminal. The attempt limit is immutable at one, and a restart cannot select Sol unless a fresh valid Luna result independently emits a configured semantic trigger.
 
 ## Run-store lifecycle
 
@@ -74,7 +76,7 @@ The checked-in GitHub Actions workflow runs that same command on Node.js 20 and 
 
 Install or link the repository as a user skill under the active Codex skill directory. Keep implicit invocation enabled in `agents/openai.yaml`. A concise global `~/.codex/AGENTS.md` rule may require `$rg` before non-trivial repository search; new sessions are required for global instruction changes.
 
-Run the diagnostic without spending a model turn:
+`doctor` checks configuration and ChatGPT login without a model turn. It does not prove hosted model availability; verify that with a bounded search for each configured tier. For `fingerprint-drift`, finish or pause concurrent edits in the target repository before rerunning the search.
 
 ```text
 node <rg-skill-root>/scripts/rg.mjs doctor --repo <git-root>

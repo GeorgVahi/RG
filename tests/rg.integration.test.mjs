@@ -100,10 +100,47 @@ test("fake Codex exercises successful and invalid-result run artifacts", { concu
         assert.equal(result.result.owners[0].path, "source.js");
         assert.equal(result.steps.length, 1);
         assert.equal(result.steps[0].repair.attempted, false);
+        assert.equal(result.steps[0].model, "gpt-6-luna");
       } finally {
         await removeTemporary(repo);
       }
     });
+
+    for (const [mode, scenario, expectedModels] of [
+      ["auto", "valid", ["gpt-6-luna"]],
+      ["auto", "gpt6-evidence-gap", ["gpt-6-luna", "gpt-6-sol"]],
+      ["deep", "gpt6-evidence-gap", ["gpt-6-sol"]],
+    ]) {
+      await t.test(`GPT-6 ${mode}/${scenario} dispatch and receipts preserve the route`, async () => {
+        const repo = await repository();
+        process.env.RG_FAKE_CODEX_SCENARIO = scenario;
+        try {
+          const result = await performSearch({
+            repo,
+            query: "Locate the source.js fixture owner and flow.",
+            mode,
+            codexBin: process.execPath,
+            codexArgsPrefix: [fakeCodex],
+            timeoutMs: 30_000,
+          });
+          assert.equal(result.status, "completed");
+          assert.deepEqual(result.steps.map((step) => step.model), expectedModels);
+          if (expectedModels.length === 2) {
+            assert.deepEqual(result.steps[0].triggers, ["cross-file-gap"]);
+          }
+          for (const step of result.steps) {
+            const receipt = JSON.parse(await fs.readFile(step.receipt, "utf8"));
+            assert.equal(receipt.status, "completed");
+            assert.equal(receipt.configured_model, step.model);
+            assert.equal(receipt.model_reasoning_effort, step.model === "gpt-6-luna" ? "low" : "medium");
+            assert.equal(receipt.sandbox, "read-only");
+            assert.equal(receipt.result_evidence, "valid");
+          }
+        } finally {
+          await removeTemporary(repo);
+        }
+      });
+    }
 
     await t.test("one external fingerprint drift restarts from Luna and completes", async () => {
       const repo = await repository();

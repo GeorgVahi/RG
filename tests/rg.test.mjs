@@ -22,6 +22,7 @@ import {
   inspectRunStatus,
   maintainRunStore,
   readAndValidateResult,
+  resolveRoute,
   rgSkillDisablePaths,
   runningProgress,
   sameModelRepairDecision,
@@ -1369,10 +1370,15 @@ test("only configured semantic trigger names are accepted", () => {
 
 test("profiles and route map preserve exact-model read-only invariants", async () => {
   const fastPath = new URL("../profiles/rg_search_fast.json", import.meta.url);
+  const balancedPath = new URL("../profiles/rg_search_balanced.json", import.meta.url);
   const mapPath = new URL("../profiles/model-map.json", import.meta.url);
   const fast = JSON.parse(await fs.readFile(fastPath, "utf8"));
+  const balanced = JSON.parse(await fs.readFile(balancedPath, "utf8"));
   const map = JSON.parse(await fs.readFile(mapPath, "utf8"));
-  assert.equal(validateProfile(fast, "rg_search_fast", "fixture").model, "gpt-5.6-luna");
+  assert.equal(validateProfile(fast, "rg_search_fast", "fixture").model, "gpt-6-luna");
+  assert.equal(fast.model_reasoning_effort, "low");
+  assert.equal(validateProfile(balanced, "rg_search_balanced", "fixture").model, "gpt-6-sol");
+  assert.equal(balanced.model_reasoning_effort, "medium");
   assert.deepEqual(validateModelMap(map, "fixture").value.routes.auto.agents, [
     "rg_search_fast",
     "rg_search_balanced",
@@ -1384,21 +1390,54 @@ test("profiles and route map preserve exact-model read-only invariants", async (
 });
 
 test("Codex dispatch pins model, effort, subscription provider, and read-only sandbox", async () => {
-  const fast = JSON.parse(
-    await fs.readFile(new URL("../profiles/rg_search_fast.json", import.meta.url), "utf8"),
-  );
-  const args = buildCodexArgs(fast, process.cwd(), path.join(process.cwd(), "result.json"), "bounded");
-  assert.equal(args[args.indexOf("-m") + 1], "gpt-5.6-luna");
-  assert.ok(args.includes('model_reasoning_effort="low"'));
-  assert.ok(args.includes('forced_login_method="chatgpt"'));
-  assert.ok(args.includes('model_provider="openai"'));
-  assert.ok(args.includes("features.multi_agent=false"));
-  const skillConfig = args.find((arg) => arg.startsWith("skills.config="));
-  assert.ok(skillConfig);
-  assert.match(skillConfig, /enabled=false/);
-  assert.match(skillConfig, /RG/i);
-  assert.equal(args[args.indexOf("--sandbox") + 1], "read-only");
-  assert.ok(args.includes("--output-schema"));
+  for (const [name, model, effort] of [
+    ["rg_search_fast", "gpt-6-luna", "low"],
+    ["rg_search_balanced", "gpt-6-sol", "medium"],
+  ]) {
+    const profile = JSON.parse(
+      await fs.readFile(new URL(`../profiles/${name}.json`, import.meta.url), "utf8"),
+    );
+    const args = buildCodexArgs(profile, process.cwd(), path.join(process.cwd(), "result.json"), "bounded");
+    assert.equal(args[args.indexOf("-m") + 1], model);
+    assert.ok(args.includes(`model_reasoning_effort="${effort}"`));
+    assert.ok(args.includes('forced_login_method="chatgpt"'));
+    assert.ok(args.includes('model_provider="openai"'));
+    assert.ok(args.includes("features.multi_agent=false"));
+    const skillConfig = args.find((arg) => arg.startsWith("skills.config="));
+    assert.ok(skillConfig);
+    assert.match(skillConfig, /enabled=false/);
+    assert.match(skillConfig, /RG/i);
+    assert.equal(args[args.indexOf("--sandbox") + 1], "read-only");
+    assert.ok(args.includes("--output-schema"));
+  }
+});
+
+test("GPT-6 defaults preserve explicit legacy user and repository model pins", async () => {
+  const repo = await fixture();
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "rg-test-home-"));
+  try {
+    const defaults = await resolveRoute(repo, "auto", home);
+    assert.deepEqual(defaults.profiles.map((profile) => profile.model), ["gpt-6-luna", "gpt-6-sol"]);
+    for (const directory of [path.join(home, "rg", "profiles"), path.join(repo, ".codex", "rg", "profiles")]) {
+      await fs.mkdir(directory, { recursive: true });
+      for (const [index, model] of ["gpt-5.6-luna", "gpt-5.6-terra"].entries()) {
+        const { source, ...profile } = defaults.profiles[index];
+        await fs.writeFile(path.join(directory, `${profile.name}.json`), JSON.stringify({ ...profile, model }));
+      }
+      for (const [mode, expected] of [
+        ["auto", ["gpt-5.6-luna", "gpt-5.6-terra"]],
+        ["fast", ["gpt-5.6-luna"]],
+        ["deep", ["gpt-5.6-terra"]],
+      ]) {
+        const resolved = await resolveRoute(repo, mode, home);
+        assert.deepEqual(resolved.profiles.map((profile) => profile.model), expected);
+        assert.ok(resolved.profiles.every((profile) => path.dirname(profile.source) === directory));
+      }
+    }
+  } finally {
+    await dispose(repo);
+    await dispose(home);
+  }
 });
 
 test("child instructions and config suppress recursive RG invocation through a linked install", async () => {

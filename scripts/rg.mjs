@@ -1631,7 +1631,7 @@ function disabledSkillsConfig(skillPaths) {
 }
 
 function developerInstructions(profile, fingerprint) {
-  const tier = profile.name === "rg_search_fast" ? "fast Luna step" : "balanced Terra step";
+  const tier = profile.name === "rg_search_fast" ? "fast step" : "balanced step";
   return `You are the already-delegated read-only RG repository scout (${tier}). Do not spawn or delegate to another agent.
 
 The parent has already satisfied every instruction to invoke the $rg skill. Do not invoke or delegate to the RG skill, load RG/SKILL.md as instructions, or execute an RG runner recursively. Focused reads of target-repository files are allowed when relevant, including files named rg.mjs; do not execute them as a nested search. Do not diagnose or report RG authentication from inside this child. Direct repository commands such as rg, rg --files, Git metadata, and focused file reads are the intended tools here.
@@ -1643,7 +1643,7 @@ ${canonicalJson(fingerprint)}
 
 Use exactly these top-level fields: schema, worktree_fingerprint, summary, owners, couplings, tests, flows, constraints, uncertainties. Evidence arrays contain flat items with path, line_start, line_end, symbol, reason, kind, and related_path. Set kind or related_path to null when not applicable. Keep paths repository-relative with forward slashes and line ranges tight (maximum 200 lines). Owners must be non-empty. Cite source, tests, configuration, and documentation only when each item directly supports the requested map. Do not cite .git, generated output, vendor, dependency, cache, coverage, dist, target, or artifact paths.
 
-Search until the request is answered or a concrete evidence gap remains. On the fast Luna step only, if the map cannot be made reliable at this tier after a real bounded search, add one uncertainty formatted exactly as trigger:<trigger>: <specific reason>, where <trigger> is insufficient-evidence, ambiguous-ownership, or cross-file-gap. Do not request escalation merely to save work. On the balanced Terra step, preserve unresolved facts as ordinary uncertainties without a trigger prefix. Keep raw logs and large file dumps out of the result.`;
+Search until the request is answered or a concrete evidence gap remains. On the fast step only, if the map cannot be made reliable at this tier after a real bounded search, add one uncertainty formatted exactly as trigger:<trigger>: <specific reason>, where <trigger> is insufficient-evidence, ambiguous-ownership, or cross-file-gap. Do not request escalation merely to save work. On the balanced step, preserve unresolved facts as ordinary uncertainties without a trigger prefix. Keep raw logs and large file dumps out of the result.`;
 }
 
 function buildCodexArgs(

@@ -43,6 +43,16 @@ async function main() {
   const isRepair = prompt.includes('"schema":"rg.repair.v1"');
   const resultFile = valueAfter(args, "-o");
   const scenario = process.env.RG_FAKE_CODEX_SCENARIO ?? "valid";
+  const model = valueAfter(args, "-m");
+  if (scenario === "gpt6-evidence-gap") {
+    const effort = { "gpt-6-luna": "low", "gpt-6-sol": "medium" }[model];
+    if (!effort || !args.includes(`model_reasoning_effort="${effort}"`)) {
+      throw new Error("fake Codex expected the GPT-6 model and effort for this tier");
+    }
+    if (valueAfter(args, "--sandbox") !== "read-only") {
+      throw new Error("fake Codex expected a read-only search");
+    }
+  }
   const invalidFlow =
     scenario === "invalid-flow-path-twice" ||
     ((scenario === "invalid-flow-path" ||
@@ -85,7 +95,10 @@ async function main() {
           ]
         : [],
     constraints: [],
-    uncertainties: [],
+    uncertainties:
+      scenario === "gpt6-evidence-gap" && model === "gpt-6-luna"
+        ? ["trigger:cross-file-gap: The fixture requires a balanced-tier evidence pass."]
+        : [],
   };
   const omitResult =
     (scenario === "missing-result" && !isRepair) ||
