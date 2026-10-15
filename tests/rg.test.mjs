@@ -743,7 +743,7 @@ test("malformed stale maintenance claims cannot borrow a live pid", async () => 
       path.join(runDirectory, "receipt.json"),
       `${JSON.stringify({ schema: "rg.receipt.v1", run_id: runId, ...receipt })}\n`,
     );
-    const claimFile = path.join(runDirectory, ".maintenance.json");
+    const claimFile = path.join(runDirectory, ".maintenance.0.json");
     await fs.writeFile(
       claimFile,
       `${JSON.stringify({
@@ -870,6 +870,143 @@ test("concurrent run-store cleanup counts each deletion exactly once", async () 
     );
     for (const runId of runIds) {
       await assert.rejects(fs.stat(path.join(home, "rg", "runs", runId)), { code: "ENOENT" });
+    }
+  } finally {
+    await dispose(home);
+  }
+});
+
+test("concurrent maintenance with staggered clocks reconciles and deletes each run once", async () => {
+  const runningId = "20200101000000000-rg_search_fast-aaaaaaaaaaaa";
+  const terminalId = "20200101000000001-rg_search_fast-bbbbbbbbbbbb";
+  for (let round = 0; round < 25; round += 1) {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "rg-test-run-store-rounds-"));
+    const runsRoot = path.join(home, "rg", "runs");
+    const nowMs = Date.now();
+    const receipts = {
+      [runningId]: {
+        status: "running",
+        started_at: new Date(nowMs - 3 * 60 * 60 * 1000).toISOString(),
+        completed_at: null,
+      },
+      [terminalId]: {
+        status: "completed",
+        started_at: new Date(nowMs - 31 * 24 * 60 * 60 * 1000).toISOString(),
+        completed_at: new Date(nowMs - 30 * 24 * 60 * 60 * 1000).toISOString(),
+      },
+    };
+    try {
+      for (const [runId, receipt] of Object.entries(receipts)) {
+        await fs.mkdir(path.join(runsRoot, runId), { recursive: true });
+        await fs.writeFile(
+          path.join(runsRoot, runId, "receipt.json"),
+          `${JSON.stringify({ schema: "rg.receipt.v1", run_id: runId, ...receipt })}\n`,
+        );
+      }
+      const settled = await Promise.allSettled(
+        Array.from({ length: 8 }, (_, index) =>
+          maintainRunStore(home, {
+            nowMs: nowMs + index * 1000,
+            staleRunMs: 2 * 60 * 60 * 1000,
+            retentionMs: 14 * 24 * 60 * 60 * 1000,
+          }),
+        ),
+      );
+      assert.deepEqual(settled.filter(({ status }) => status === "rejected"), [], `round ${round}`);
+      const reports = settled.map(({ value }) => value);
+      assert.equal(
+        reports.reduce((total, report) => total + report.reconciled, 0),
+        1,
+        `round ${round}`,
+      );
+      assert.equal(
+        reports.reduce((total, report) => total + report.deleted, 0),
+        1,
+        `round ${round}`,
+      );
+      const receipt = JSON.parse(
+        await fs.readFile(path.join(runsRoot, runningId, "receipt.json"), "utf8"),
+      );
+      assert.equal(receipt.failure_reason, "stale-run-reconciled");
+      assert.deepEqual(await fs.readdir(runsRoot), [runningId]);
+    } finally {
+      await dispose(home);
+    }
+  }
+});
+
+test("maintenance claims wait for live or mid-write owners and recover a dead owner once", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "rg-test-run-store-claims-"));
+  const nowMs = Date.now();
+  const heldId = "20200101000000000-rg_search_fast-aaaaaaaaaaaa";
+  const futureId = "20200101000000001-rg_search_fast-bbbbbbbbbbbb";
+  const runDirectory = (runId) => path.join(home, "rg", "runs", runId);
+  const claimFile = (runId, generation) =>
+    path.join(runDirectory(runId), `.maintenance.${generation}.json`);
+  const heldClaim = (generation, pid) => ({
+    schema: "rg.maintenance-claim.v2",
+    run_id: heldId,
+    generation,
+    claim_id: "c".repeat(24),
+    pid,
+    state: "held",
+    claimed_at: new Date(nowMs).toISOString(),
+  });
+  const receiptStatus = async (runId) =>
+    JSON.parse(await fs.readFile(path.join(runDirectory(runId), "receipt.json"), "utf8")).status;
+  const options = { nowMs, staleRunMs: 2 * 60 * 60 * 1000 };
+  for (const runId of [heldId, futureId]) {
+    await fs.mkdir(runDirectory(runId), { recursive: true });
+    await fs.writeFile(
+      path.join(runDirectory(runId), "receipt.json"),
+      `${JSON.stringify({
+        schema: "rg.receipt.v1",
+        run_id: runId,
+        status: "running",
+        started_at: new Date(nowMs - 3 * 60 * 60 * 1000).toISOString(),
+        completed_at: null,
+      })}\n`,
+    );
+  }
+  await fs.writeFile(claimFile(heldId, 0), `${JSON.stringify(heldClaim(0, process.pid))}\n`);
+  await fs.writeFile(claimFile(futureId, 0), "");
+  const future = new Date(nowMs + 365 * 24 * 60 * 60 * 1000);
+  await fs.utimes(claimFile(futureId, 0), future, future);
+  try {
+    let report = await maintainRunStore(home, options);
+    assert.equal(report.stale_running, 2);
+    assert.equal(report.reconciled, 1);
+    assert.equal(await receiptStatus(heldId), "running");
+    assert.equal(await receiptStatus(futureId), "failed");
+
+    await fs.writeFile(
+      claimFile(heldId, 0),
+      `${JSON.stringify({ ...heldClaim(0, process.pid), state: "released" })}\n`,
+    );
+    await fs.writeFile(claimFile(heldId, 1), "");
+    report = await maintainRunStore(home, options);
+    assert.equal(report.reconciled, 0);
+    assert.equal(await receiptStatus(heldId), "running");
+
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+    await fs.writeFile(claimFile(heldId, 1), `${JSON.stringify(heldClaim(1, deadPid))}\n`);
+    const reports = await Promise.all(
+      Array.from({ length: 4 }, () => maintainRunStore(home, options)),
+    );
+    assert.equal(reports.reduce((total, current) => total + current.reconciled, 0), 1);
+    assert.equal(await receiptStatus(heldId), "failed");
+    assert.deepEqual(
+      JSON.parse(await fs.readFile(claimFile(heldId, 1), "utf8")),
+      heldClaim(1, deadPid),
+    );
+    const successors = (await fs.readdir(runDirectory(heldId)))
+      .map((name) => /^\.maintenance\.(\d+)\.json$/.exec(name))
+      .filter((match) => match && Number(match[1]) > 1);
+    assert.equal(successors.length >= 1, true);
+    for (const [name] of successors) {
+      const successor = JSON.parse(await fs.readFile(path.join(runDirectory(heldId), name), "utf8"));
+      assert.equal(successor.state, "released");
+      assert.equal(successor.pid, process.pid);
     }
   } finally {
     await dispose(home);

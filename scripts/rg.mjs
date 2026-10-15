@@ -65,6 +65,11 @@ const RUN_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const RUN_COUNT_CLEANUP_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_RETAINED_RUNS = 200;
 const RUN_ID_PATTERN = /^\d{17}-rg_search_(?:fast|balanced)-[a-f0-9]{12}$/;
+const MAINTENANCE_CLAIM_SCHEMA = "rg.maintenance-claim.v2";
+const MAINTENANCE_CLAIM_PATTERN = /^\.maintenance\.(0|[1-9][0-9]{0,14})\.json$/;
+const MAINTENANCE_CLAIM_WRITE_GRACE_MS = RUN_HEARTBEAT_INTERVAL_MS * 4;
+const RUN_DETACHED_PATTERN =
+  /^\.\d{17}-rg_search_(?:fast|balanced)-[a-f0-9]{12}\.(\d{13})\.[a-f0-9]{12}\.deleting$/;
 const OWNER_PATH_SOURCE = "owner-fingerprint-inventory";
 const REPAIRABLE_RESULT_CATEGORIES = new Set([
   "path-outside-inventory",
@@ -2170,68 +2175,118 @@ async function finalizeReceiptIfRunning(
   return true;
 }
 
-async function acquireRunMaintenanceClaim(runDir, runId, nowMs) {
-  const claimFile = path.join(runDir, ".maintenance.json");
-  const claimId = randomBytes(12).toString("hex");
-  const claim = {
-    schema: "rg.maintenance-claim.v1",
-    run_id: runId,
-    claim_id: claimId,
-    pid: process.pid,
-    claimed_at: new Date(nowMs).toISOString(),
-  };
-  const create = async () => {
-    try {
-      await fsp.writeFile(claimFile, `${JSON.stringify(claim)}\n`, {
-        encoding: "utf8",
-        mode: 0o600,
-        flag: "wx",
-      });
-      return true;
-    } catch (error) {
-      if (["EEXIST", "ENOENT"].includes(error.code)) return false;
-      throw error;
-    }
-  };
-  if (!(await create())) {
-    const info = await fsp.lstat(claimFile).catch(() => null);
-    if (!info) return null;
-    if (!info.isFile() || info.isSymbolicLink()) return null;
-    const ageMs = nowMs - info.mtimeMs;
-    if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < RUN_HEARTBEAT_INTERVAL_MS * 4) {
-      return null;
-    }
-    const existing = await readRunReceipt(claimFile);
-    const claimedMs = Date.parse(existing?.claimed_at);
-    const validOwner =
-      existing?.schema === "rg.maintenance-claim.v1" &&
-      existing.run_id === runId &&
-      typeof existing.claim_id === "string" &&
-      /^[a-f0-9]{24}$/.test(existing.claim_id) &&
-      Number.isInteger(existing.pid) &&
-      existing.pid > 0 &&
-      Number.isFinite(claimedMs) &&
-      claimedMs <= nowMs;
-    if (validOwner && processIsAlive(existing.pid)) return null;
-    const staleClaim = `${claimFile}.${randomBytes(12).toString("hex")}.stale`;
-    try {
-      await fsp.rename(claimFile, staleClaim);
-    } catch (error) {
-      if (["ENOENT", "EEXIST", "ENOTEMPTY"].includes(error.code)) return null;
-      throw error;
-    }
-    await fsp.unlink(staleClaim).catch(() => {});
-    if (!(await create())) return null;
+function maintenanceClaimFile(runDir, generation) {
+  return path.join(runDir, `.maintenance.${generation}.json`);
+}
+
+async function latestMaintenanceClaimGeneration(runDir) {
+  let names;
+  try {
+    names = await fsp.readdir(runDir);
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
   }
-  return {
-    async release() {
-      const current = await readRunReceipt(claimFile);
-      if (current?.claim_id !== claimId) return;
-      await fsp.unlink(claimFile).catch((error) => {
-        if (error.code !== "ENOENT") throw error;
-      });
-    },
+  let latest = -1;
+  for (const name of names) {
+    const match = MAINTENANCE_CLAIM_PATTERN.exec(name);
+    if (match) latest = Math.max(latest, Number(match[1]));
+  }
+  return latest;
+}
+
+async function maintenanceClaimMayBeHeld(runDir, runId, generation) {
+  const claimFile = maintenanceClaimFile(runDir, generation);
+  const info = await fsp.lstat(claimFile).catch(() => null);
+  if (!info) return false;
+  if (!info.isFile() || info.isSymbolicLink()) return true;
+  const claim = await readRunReceipt(claimFile);
+  if (
+    claim?.schema === MAINTENANCE_CLAIM_SCHEMA &&
+    claim.run_id === runId &&
+    claim.generation === generation &&
+    typeof claim.claim_id === "string" &&
+    /^[a-f0-9]{24}$/.test(claim.claim_id) &&
+    Number.isInteger(claim.pid) &&
+    claim.pid > 0 &&
+    ["held", "released"].includes(claim.state)
+  ) {
+    return claim.state === "held" && processIsAlive(claim.pid);
+  }
+  // Exclusive creation is not atomic with the write, so an unreadable claim may be mid-write.
+  return Math.abs(Date.now() - info.mtimeMs) < MAINTENANCE_CLAIM_WRITE_GRACE_MS;
+}
+
+// Claims form an append-only succession of generations: a claimant exclusively creates the
+// generation after the newest one, and only once that one is released, dead, or abandoned.
+// No claimant ever moves or removes another claimant's file, and the post-create checks
+// make a succession over a suspended mid-write owner abort on at least one side.
+async function acquireRunMaintenanceClaim(runDir, runId) {
+  const latest = await latestMaintenanceClaimGeneration(runDir);
+  if (latest === null) return null;
+  if (latest >= 0 && (await maintenanceClaimMayBeHeld(runDir, runId, latest))) return null;
+  const generation = latest + 1;
+  if (!Number.isSafeInteger(generation)) return null;
+  const claimFile = maintenanceClaimFile(runDir, generation);
+  const claim = {
+    schema: MAINTENANCE_CLAIM_SCHEMA,
+    run_id: runId,
+    generation,
+    claim_id: randomBytes(12).toString("hex"),
+    pid: process.pid,
+    state: "held",
+    claimed_at: new Date().toISOString(),
   };
+  try {
+    await fsp.writeFile(claimFile, `${JSON.stringify(claim)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+  } catch (error) {
+    if (["EEXIST", "ENOENT"].includes(error.code)) return null;
+    throw error;
+  }
+  const release = async () => {
+    const current = await readRunReceipt(claimFile);
+    if (current?.claim_id !== claim.claim_id || current.state !== "held") return;
+    try {
+      await atomicWriteJson(
+        claimFile,
+        { ...claim, state: "released", released_at: new Date().toISOString() },
+        { ensureParent: false },
+      );
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  };
+  if (
+    (latest >= 0 && (await maintenanceClaimMayBeHeld(runDir, runId, latest))) ||
+    (await latestMaintenanceClaimGeneration(runDir)) !== generation
+  ) {
+    await release();
+    return null;
+  }
+  return { release };
+}
+
+async function detachRunDirectory(runsRoot, runDir) {
+  const detachedDir = path.join(
+    runsRoot,
+    `.${path.basename(runDir)}.${Date.now()}.${randomBytes(6).toString("hex")}.deleting`,
+  );
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fsp.rename(runDir, detachedDir);
+      return detachedDir;
+    } catch (error) {
+      if (process.platform !== "win32" || !["EACCES", "EBUSY", "EPERM"].includes(error.code)) {
+        throw error;
+      }
+      if (attempt >= 3) return null;
+      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+  }
 }
 
 function emptyRunStoreReport() {
@@ -2265,6 +2320,14 @@ async function maintainRunStore(home = codexHome(), options = {}) {
   const records = [];
   const entries = await fsp.readdir(runsRoot, { withFileTypes: true });
   for (const entry of entries) {
+    const detached = RUN_DETACHED_PATTERN.exec(entry.name);
+    if (
+      detached &&
+      entry.isDirectory() &&
+      Math.abs(Date.now() - Number(detached[1])) < MAINTENANCE_CLAIM_WRITE_GRACE_MS
+    ) {
+      continue;
+    }
     if (!RUN_ID_PATTERN.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) {
       report.invalid_entries += 1;
       continue;
@@ -2309,7 +2372,7 @@ async function maintainRunStore(home = codexHome(), options = {}) {
     if (ageMs <= staleRunMs || active) continue;
     report.stale_running += 1;
     if (!mutate) continue;
-    const claim = await acquireRunMaintenanceClaim(record.runDir, record.receipt.run_id, nowMs);
+    const claim = await acquireRunMaintenanceClaim(record.runDir, record.receipt.run_id);
     if (!claim) continue;
     try {
       const latest = await readRunReceipt(record.receiptFile);
@@ -2377,7 +2440,7 @@ async function maintainRunStore(home = codexHome(), options = {}) {
     if (!eligible) continue;
     report.cleanup_eligible += 1;
     if (!mutate) continue;
-    const claim = await acquireRunMaintenanceClaim(record.runDir, record.receipt.run_id, nowMs);
+    const claim = await acquireRunMaintenanceClaim(record.runDir, record.receipt.run_id);
     if (!claim) continue;
     try {
       const latest = await readRunReceipt(record.receiptFile);
@@ -2400,13 +2463,15 @@ async function maintainRunStore(home = codexHome(), options = {}) {
       ) {
         continue;
       }
-      await fsp.rm(record.runDir, {
+      const detachedDir = await detachRunDirectory(runsRoot, record.runDir);
+      if (!detachedDir) continue;
+      record.deleted = true;
+      await fsp.rm(detachedDir, {
         recursive: true,
         force: false,
         maxRetries: process.platform === "win32" ? 3 : 0,
         retryDelay: 50,
       });
-      record.deleted = true;
       report.deleted += 1;
     } finally {
       if (!record.deleted) await claim.release();
