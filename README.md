@@ -1,6 +1,6 @@
 # RG
 
-RG is a Codex skill for delegating non-trivial repository search to explicit, cheaper model tiers while keeping the parent agent focused on implementation and decisions.
+RG is a Codex skill for delegating non-trivial repository search to explicit, cheaper model tiers while keeping the parent agent focused on implementation and decisions. A small [Claude Code adapter](#claude-code) applies the same split with a Haiku Explore agent: in our benchmark it cut search token cost by 79% against Opus, and each search took about 1.6× as long.
 
 Its default route is deterministic:
 
@@ -31,7 +31,7 @@ Each active run holds a contract-bound heartbeat lease and emits machine-readabl
 
 No npm dependencies are required.
 
-Version 0.4.0 moves the default scout to GPT-6 Luna and the balanced tier from GPT-5.6 Terra to GPT-6 Sol. Existing repo/user model overrides remain in force; see [configuration](references/configuration.md) before upgrading a pinned installation.
+Version 0.4.0 moves the default scout to GPT-6 Luna and the balanced tier from GPT-5.6 Terra to GPT-6 Sol. Existing repo/user model overrides remain in force; see [configuration](references/configuration.md) before upgrading a pinned installation. Version 0.5.0 adds the Claude Code adapter and leaves the Codex route unchanged.
 
 ## Install as a user skill
 
@@ -92,6 +92,46 @@ npm run doctor
 `npm run check` is the release gate: skill validation, unit tests, fake-transport integration tests, a deterministic end-to-end canary, and `git diff --check`. The canary creates isolated temporary Git/Codex homes, exercises the real runner and receipt path through the bundled fake Codex executable, and removes its temporary data; it needs no model access or credentials. GitHub Actions runs the same gate on Node.js 20 and 22 on both Windows and Linux. `npm run doctor` remains the local environment/auth/config diagnostic and is intentionally separate from hermetic CI.
 
 Run artifacts and receipts are written outside the target repository under `$CODEX_HOME/rg/runs`.
+
+## Claude Code
+
+Claude Code already gives every subagent its own context and its own pinned model, so RG's Codex runner is not needed there. The `claude-code/` adapter applies the same split with two files:
+
+- [`claude-code/agents/Explore.md`](claude-code/agents/Explore.md) overrides the built-in Explore agent. It runs on Haiku with read-only `Read`/`Grep`/`Glob`, keeps RG's exact-path rule, returns a compact `path:start-end` map, and reports an `escalate:` line for a real evidence gap.
+- [`claude-code/CLAUDE.md`](claude-code/CLAUDE.md) is the routing rule. It delegates non-trivial search to Explore, keeps known paths and one-shot lookups in the main session, reads cited ranges before edits, and escalates once to `sonnet` on `escalate:`.
+
+Measured on four code-mapping tasks in a 7,500-file repository, with the main session on Opus:
+
+| Explore variant | Price-weighted tokens vs built-in Opus | Mean time per search |
+|---|---:|---:|
+| **RG adapter (Haiku)** | **21% (−79%)** | **2.1 min** |
+| Built-in Explore on Haiku | 42% (−58%) | 3.0 min |
+| Built-in Explore on Sonnet | 80% (−20%) | 1.4 min |
+| Built-in Explore on Opus (the default when the main session runs Opus) | 100% | 1.3 min |
+
+Every variant found the same owners, flows, and tests, and none reported a nonexistent path.
+
+**Trade-off: the saving costs time.** A search through the adapter takes about 1.6× as long as built-in Explore on Opus: 2.1 against 1.3 minutes on average, and up to 2.8 minutes on the hardest task. Use it when plan limits or token spend matter more than latency. The adapter's prompt was tuned on these same tasks, so the saving may be smaller on other repositories. Method, per-task numbers, and limits are in the [benchmark](claude-code/BENCHMARK.md).
+
+Install for every project on macOS/Linux:
+
+```sh
+mkdir -p ~/.claude/agents
+ln -s ~/src/RG/claude-code/agents/Explore.md ~/.claude/agents/Explore.md
+cat ~/src/RG/claude-code/CLAUDE.md >> ~/.claude/CLAUDE.md
+```
+
+Windows PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\agents" | Out-Null
+Copy-Item C:\PROJECTS\RG\claude-code\agents\Explore.md "$env:USERPROFILE\.claude\agents\Explore.md"
+Get-Content C:\PROJECTS\RG\claude-code\CLAUDE.md | Add-Content "$env:USERPROFILE\.claude\CLAUDE.md"
+```
+
+For a single project, use `<project>/.claude/agents/` and the project's `CLAUDE.md` instead. Agent definitions are read when a session starts, so open a new session afterwards. To change the tier, edit `model:`. To uninstall, remove the agent file and the appended section.
+
+Do not link this repository's `SKILL.md` into `~/.claude/skills`; it launches the Codex runner.
 
 ## License and attribution
 

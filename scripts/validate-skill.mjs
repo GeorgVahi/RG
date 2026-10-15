@@ -20,6 +20,8 @@ const required = [
   "tests/rg.integration.test.mjs",
   "tests/fixtures/fake-codex.mjs",
   ".github/workflows/ci.yml",
+  "claude-code/agents/Explore.md",
+  "claude-code/CLAUDE.md",
 ];
 
 for (const relative of required) {
@@ -69,6 +71,29 @@ if (!/allow_implicit_invocation:\s*true/.test(openai)) {
 }
 if (!/default_prompt:[^\r\n]*\$rg/.test(openai)) {
   throw new Error("agents/openai.yaml default_prompt must mention $rg");
+}
+
+const scout = await fs.readFile(path.join(root, "claude-code", "agents", "Explore.md"), "utf8");
+const scoutFrontmatter = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(scout)?.[1];
+if (!scoutFrontmatter) throw new Error("claude-code/agents/Explore.md must begin with YAML frontmatter");
+if (!/^name:\s*Explore\s*$/m.test(scoutFrontmatter)) {
+  throw new Error("Claude Code scout must be named Explore so it overrides the built-in agent");
+}
+if (!/^model:\s*\S+\s*$/m.test(scoutFrontmatter) || /^model:\s*inherit\s*$/m.test(scoutFrontmatter)) {
+  throw new Error("Claude Code scout must pin an explicit model");
+}
+const scoutTools = /^tools:\s*(.+)$/m.exec(scoutFrontmatter)?.[1].split(",").map((tool) => tool.trim());
+if (!scoutTools || scoutTools.some((tool) => !["Read", "Grep", "Glob"].includes(tool))) {
+  throw new Error("Claude Code scout must stay read-only: tools may only be Read, Grep, Glob");
+}
+if (!scout.includes("escalate:")) {
+  throw new Error("Claude Code scout must retain the escalate: evidence-gap contract");
+}
+const routing = await fs.readFile(path.join(root, "claude-code", "CLAUDE.md"), "utf8");
+for (const requiredRoutingToken of ["Explore", "escalate:", "sonnet"]) {
+  if (!routing.includes(requiredRoutingToken)) {
+    throw new Error(`claude-code/CLAUDE.md must retain routing instruction: ${requiredRoutingToken}`);
+  }
 }
 
 const readJson = async (relative) => JSON.parse(await fs.readFile(path.join(root, relative), "utf8"));
