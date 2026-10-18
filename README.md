@@ -31,7 +31,7 @@ Each active run holds a contract-bound heartbeat lease and emits machine-readabl
 
 No npm dependencies are required.
 
-Version 0.4.0 moves the default scout to GPT-6 Luna and the balanced tier from GPT-5.6 Terra to GPT-6 Sol. Existing repo/user model overrides remain in force; see [configuration](references/configuration.md) before upgrading a pinned installation. Version 0.5.0 adds the Claude Code adapter and leaves the Codex route unchanged. Version 0.5.1 adds sandbox access checks and the optional bounded NAS reader described below.
+Version 0.4.0 moves the default scout to GPT-6 Luna and the balanced tier from GPT-5.6 Terra to GPT-6 Sol. Existing repo/user model overrides remain in force; see [configuration](references/configuration.md) before upgrading a pinned installation. Version 0.5.0 adds the Claude Code adapter and leaves the Codex route unchanged. Version 0.5.1 adds sandbox access checks and the optional bounded NAS reader described below. Version 0.6.0 fixes deleted tracked files and NAS fingerprint deadlines, shares a metadata-only snapshot with the broker, and adds resumable search/read pagination and preparation diagnostics.
 
 ## Install as a user skill
 
@@ -94,6 +94,12 @@ node scripts/rg.mjs search --repo <git-root> --mode auto --access broker --query
 ```
 
 The broker reads the repository in place through three read-only MCP tools. It checks paths and fingerprints, refuses links and common secret paths, and limits returned content. The scout keeps its read-only sandbox with shell and unrelated tools disabled. There is no local repository copy or permanent configuration change. The default remains `--access native`; see [access limits and diagnostics](references/configuration.md#repository-access-and-nas).
+
+A normal broker step performs two full fingerprints, before and after the scout. Deleted tracked files remain explicit snapshot states and never become source evidence. Eight bounded readers hash the original files; broker startup reuses the per-run metadata manifest. No source tree is cached locally. The default snapshot budget is 120 seconds, configurable with `--fingerprint-timeout 1..600`; `--timeout` is shared by the entire route, including repair and restart. Deadlines terminate owned worker processes.
+
+Preparation has a receipt and heartbeat before the first fingerprint. Failures report their phase and counters; `doctor` reports the executing and installed skill versions. Broker pages distinguish excluded, unreadable and remaining files. Follow opaque cursors with unchanged parameters to continue inside a file or finish a long line read.
+
+**0.6 compatibility:** new searches use fingerprint inventory `git-worktree-state-v2` and `rg.snapshot-manifest.v2`. Old receipts remain readable; fingerprints and cursors cannot be reused across versions/runs. Update all packaged scripts and the schema together. Model overrides stay unchanged. Submodules are explicit metadata boundaries; search a submodule as its own repository when its source is needed.
 
 ## Verify
 

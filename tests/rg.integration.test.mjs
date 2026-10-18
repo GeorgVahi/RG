@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   RGError,
@@ -11,6 +11,7 @@ import {
   developerInstructions,
   doctor,
   failureResult,
+  inspectRunStatus,
   performSearch,
   rgSkillDisablePaths,
 } from "../scripts/rg.mjs";
@@ -62,7 +63,9 @@ test("fake Codex exercises successful and invalid-result run artifacts", { concu
           codexArgsPrefix: [fakeCodex], timeoutMs: 30_000 }), (error) => {
           assert.equal(error.code, "sandbox-read-denied");
           assert.equal(error.details.repair, undefined);
-          assert.equal(error.details.receipt, undefined);
+          assert.equal(typeof error.details.receipt, "string");
+          assert.equal(error.details.stage, "access");
+          assert.equal(typeof error.details.run_id, "string");
           return true;
         });
       } finally { await removeTemporary(repo); }
@@ -79,6 +82,11 @@ test("fake Codex exercises successful and invalid-result run artifacts", { concu
         const receipt = JSON.parse(await fs.readFile(result.steps[0].receipt, "utf8"));
         assert.equal(receipt.repository_access.read_only, true);
         assert.equal(receipt.sandbox, "read-only");
+        assert.equal(receipt.measurements.full_snapshots, 2);
+        assert.equal(receipt.preparation.dispatched, true);
+        const manifest = JSON.parse(await fs.readFile(path.join(path.dirname(result.steps[0].receipt), "snapshot.json"), "utf8"));
+        assert.equal(manifest.schema, "rg.snapshot-manifest.v2");
+        assert.equal(JSON.stringify(manifest).includes("export function owner()"), false);
       } finally { await removeTemporary(repo); }
     });
 
@@ -95,7 +103,34 @@ test("fake Codex exercises successful and invalid-result run artifacts", { concu
         assert.equal(result.repository_access.transport, "broker");
         const receipt = JSON.parse(await fs.readFile(result.steps[0].receipt, "utf8"));
         assert.equal(receipt.repository_access.read_only, true);
+        assert.equal(receipt.measurements.full_snapshots, 4);
       } finally { await removeTemporary(repo); }
+    });
+
+    await t.test("pre-model fingerprint timeout has a terminal receipt and no surviving lease", async () => {
+      const repo = await repository(), hook = path.join(repo, "hang-fingerprint.mjs");
+      process.env.RG_FAKE_CODEX_SCENARIO = "valid-broker";
+      await fs.writeFile(hook, "import fs from 'node:fs'; if(process.argv[1]?.endsWith('snapshot-worker.mjs')) { fs.promises.open=async()=>new Promise(()=>{}); setInterval(()=>{},1000); }\n");
+      const previousOptions = process.env.NODE_OPTIONS;
+      process.env.NODE_OPTIONS = `--import=${pathToFileURL(hook).href}`;
+      let failure;
+      try {
+        await assert.rejects(performSearch({ repo, query: "Locate source.js", codexBin: process.execPath,
+          codexArgsPrefix: [fakeCodex], accessMode: "broker", timeoutMs: 30_000, fingerprintMs: 1000 }), (error) => {
+          failure = error; return error.code === "fingerprint-timeout";
+        });
+        const receipt = JSON.parse(await fs.readFile(failure.details.receipt, "utf8"));
+        assert.equal(receipt.status, "failed");
+        assert.equal(receipt.dispatch_method, "not-dispatched");
+        assert.equal(receipt.preparation.dispatched, false);
+        assert.equal(receipt.preparation.phase, "fingerprint-pre");
+        assert.equal(receipt.measurements.full_snapshots, 0);
+        assert.equal((await inspectRunStatus({ home, runId: failure.details.run_id })).state, "failed");
+        await assert.rejects(fs.stat(path.join(path.dirname(failure.details.receipt), "active.json")), { code: "ENOENT" });
+      } finally {
+        if (previousOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = previousOptions;
+        await removeTemporary(repo);
+      }
     });
 
     await t.test("real Codex prompt parser removes RG from the child-visible skill catalog", (subtest) => {

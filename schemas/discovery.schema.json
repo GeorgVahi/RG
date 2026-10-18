@@ -25,7 +25,7 @@
         "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "files": { "type": "integer", "minimum": 0, "maximum": 100000 },
         "bytes": { "type": "integer", "minimum": 0, "maximum": 2147483648 },
-        "inventory": { "type": "string", "const": "git-tracked-untracked-nonignored-v1" }
+        "inventory": { "type": "string", "const": "git-worktree-state-v2" }
       }
     },
     "summary": { "type": "string", "minLength": 1, "maxLength": 8192 },

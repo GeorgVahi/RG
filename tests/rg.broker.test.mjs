@@ -65,7 +65,7 @@ test("broker pagination preserves filtered inventory positions and reports trunc
   do {
     const page = await reader.call("list_files", { contains: ".js", cursor, limit: 1 });
     found.push(...page.paths);
-    assert.ok(page.next_cursor === null || page.next_cursor > cursor);
+    assert.ok(page.next_cursor === null || typeof page.next_cursor === "string");
     cursor = page.next_cursor;
   } while (cursor !== null);
   assert.deepEqual(found, ["a.js", "c.js", "папка с пробелом/source.js"]);
@@ -73,15 +73,18 @@ test("broker pagination preserves filtered inventory positions and reports trunc
   assert.equal(first.matches[0].path, "a.js");
   assert.equal(first.matches_truncated_in_last_file, true);
   const second = await reader.call("search", { query: "needle", cursor: first.next_cursor, limit: 1 });
-  assert.equal(second.matches[0].path, "c.js");
+  assert.equal(second.matches[0].path, "a.js");
+  assert.equal(second.matches[0].line, 2);
+  const third = await reader.call("search", { query: "needle", cursor: second.next_cursor, limit: 1 });
+  assert.equal(third.matches[0].line, 3);
+  const fourth = await reader.call("search", { query: "needle", cursor: third.next_cursor, limit: 1 });
+  assert.equal(fourth.matches[0].path, "c.js");
+  await assert.rejects(reader.call("search", { query: "different", cursor: first.next_cursor }), { code: "broker-invalid-cursor" });
   const remainder = await reader.call("read_lines", { path: "a.js", line_start: 2, line_end: 3 });
   assert.equal(remainder.text, "needle two\nneedle three");
-  const last = await reader.call("list_files", { cursor: reader.paths.length });
-  assert.deepEqual(last.paths, []);
-  assert.equal(last.next_cursor, null);
-  for (const invalid of [-1, 1.5, reader.paths.length + 1]) {
-    await assert.rejects(reader.call("list_files", { cursor: invalid }), { code: "broker-invalid-request" });
-    await assert.rejects(reader.call("search", { query: "needle", cursor: invalid }), { code: "broker-invalid-request" });
+  for (const invalid of [-1, 1.5, reader.paths.length + 1, "forged-cursor"]) {
+    await assert.rejects(reader.call("list_files", { cursor: invalid }), { code: "broker-invalid-cursor" });
+    await assert.rejects(reader.call("search", { query: "needle", cursor: invalid }), { code: "broker-invalid-cursor" });
   }
 });
 
@@ -149,7 +152,13 @@ test("broker rejects tracked ignored files and bounds oversized responses", asyn
   const reader = await createRepositoryReader({ repo, snapshot: await computeFingerprint(repo) });
   assert.equal(reader.paths.includes("ignored.txt"), false);
   await assert.rejects(reader.call("read_lines", { path: "ignored.txt" }), { code: "broker-path-denied" });
-  await assert.rejects(reader.call("read_lines", { path: "large-line.js", line_start: 1, line_end: 1 }), { code: "broker-output-limit" });
+  let cursor, combined = "";
+  do {
+    const page = await reader.call("read_lines", { path: "large-line.js", line_start: 1, line_end: 1, ...(cursor ? { cursor } : {}) });
+    combined += page.text; cursor = page.next_cursor;
+    assert.ok(Buffer.byteLength(JSON.stringify(page)) < 48 * 1024);
+  } while (cursor);
+  assert.equal(combined, "x".repeat(50 * 1024));
 });
 
 test("stdio protocol preserves split UTF-8 and exposes only the three read tools", async (t) => {
@@ -177,4 +186,71 @@ test("stdio protocol preserves split UTF-8 and exposes only the three read tools
 test("stdio rejects oversized requests before dispatching any tool", async () => {
   await assert.rejects(serveRepositoryReader({ call() { assert.fail("must not dispatch"); } },
     Readable.from([Buffer.alloc(64 * 1024 + 1, 120)]), new Writable({ write(_chunk, _encoding, done) { done(); } })), /broker-input-limit/);
+});
+
+test("coverage distinguishes unreadable text, content policy and large-file exclusions", async (t) => {
+  const repo = await fixture(t);
+  await fs.writeFile(path.join(repo, "binary.dat"), Buffer.from([0, 110, 101, 101, 100, 108, 101]));
+  await fs.writeFile(path.join(repo, "invalid.txt"), Buffer.from([0xff, 0xfe]));
+  await fs.writeFile(path.join(repo, "private.txt"), "-----BEGIN PRIVATE KEY-----\nsynthetic fixture\n");
+  await fs.writeFile(path.join(repo, "large.txt"), "x".repeat(2 * 1024 * 1024 + 1));
+  const reader = await createRepositoryReader({ repo, snapshot: await computeFingerprint(repo) });
+  const result = await reader.call("search", { query: "owner" });
+  assert.equal(result.remaining_files, 0);
+  assert.equal(result.truncated, false);
+  assert.equal(result.complete, false);
+  assert.equal(result.unreadable_files, 3);
+  assert.equal(result.unreadable_reasons["broker-non-text-file"], 2);
+  assert.equal(result.unreadable_reasons["broker-content-denied"], 1);
+  assert.equal(result.exclusion_reasons["large-file"], 1);
+  assert.equal(result.exclusion_reasons["path-policy"], 1);
+  assert.equal(result.matches.length, 1);
+});
+
+test("line chunks preserve exact boundaries, empty lines and query/snapshot cursor binding", async (t) => {
+  const repo = await fixture(t), content = "x".repeat(6000) + "\n\n" + "needle ".repeat(2000) + "\nlast";
+  await fs.writeFile(path.join(repo, "chunks.js"), content);
+  const snapshot = await computeFingerprint(repo), reader = await createRepositoryReader({ repo, snapshot });
+  let cursor, combined = "", firstCursor;
+  do {
+    const page = await reader.call("read_lines", { path: "chunks.js", line_start: 1, line_end: 4, ...(cursor ? { cursor } : {}) });
+    combined += page.text; cursor = page.next_cursor; firstCursor ??= cursor;
+  } while (cursor);
+  assert.equal(combined, content);
+  await assert.rejects(reader.call("read_lines", { path: "chunks.js", line_start: 2, line_end: 4, cursor: firstCursor }), { code: "broker-invalid-cursor" });
+  const other = await createRepositoryReader({ repo, snapshot });
+  await assert.rejects(other.call("read_lines", { path: "chunks.js", line_start: 1, line_end: 4, cursor: firstCursor }), { code: "broker-invalid-cursor" });
+  const found = await reader.call("search", { query: "needle" });
+  assert.equal(found.matches[0].line, 3);
+  assert.equal(found.matches[0].text_truncated, true);
+});
+
+test("stdio validates UTF-8, incomplete frames and cancellation of timed out reads", async () => {
+  const sink = () => new Writable({ write(_chunk, _encoding, done) { done(); } });
+  await assert.rejects(serveRepositoryReader({}, Readable.from([Buffer.from([0xff, 0x0a])]), sink()), /broker-invalid-utf8/);
+  await assert.rejects(serveRepositoryReader({}, Readable.from([Buffer.from('{"jsonrpc":')]), sink()), /broker-incomplete-request/);
+  let aborted = false;
+  const requests = [
+    { jsonrpc: "2.0", id: 1, method: "initialize" },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "search", arguments: { query: "x" } } },
+  ].map(JSON.stringify).join("\n") + "\n";
+  await assert.rejects(serveRepositoryReader({ call(_name, _args, { signal }) {
+    return new Promise((_, reject) => signal.addEventListener("abort", () => { aborted = true; reject(new Error("aborted")); }, { once: true }));
+  } }, Readable.from([Buffer.from(requests)]), sink(), { requestTimeoutMs: 20 }), /broker-request-timeout/);
+  assert.equal(aborted, true);
+  await assert.rejects(serveRepositoryReader({}, Readable.from([Buffer.from("{bad}\n".repeat(513))]), sink()), /broker-request-limit/);
+});
+
+test("listing long paths uses a byte-bounded page and retains every continuation", async (t) => {
+  const repo = await fixture(t), snapshot = await computeFingerprint(repo);
+  const paths = Array.from({ length: 100 }, (_, index) => `${String(index).padStart(3, "0")}/${"a".repeat(200)}/${"b".repeat(200)}/${"c".repeat(200)}/source.js`);
+  const synthetic = { ...snapshot, paths: new Set(paths), ignored: [], entries: new Map(paths.map((p) => [p, { kind: "file", bytes: 1 }])) };
+  const reader = await createRepositoryReader({ repo, snapshot: synthetic });
+  const all = []; let cursor;
+  do {
+    const page = await reader.call("list_files", { limit: 100, ...(cursor ? { cursor } : {}) });
+    all.push(...page.paths); cursor = page.next_cursor;
+    assert.ok(Buffer.byteLength(JSON.stringify(page)) < 48 * 1024);
+  } while (cursor);
+  assert.deepEqual(all, paths);
 });

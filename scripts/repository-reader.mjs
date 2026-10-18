@@ -1,7 +1,7 @@
-import { promises as fs, constants } from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { createHash, createHmac, randomBytes } from "node:crypto";
+import { runBounded } from "./bounded-process.mjs";
+import { openRepository, safeRelative } from "./repository-fs.mjs";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 48 * 1024;
@@ -17,7 +17,7 @@ export class RepositoryReadError extends Error {
 const reject = (code = "broker-invalid-request") => { throw new RepositoryReadError(code); };
 
 export function readableRepositoryPath(value) {
-  if (typeof value !== "string" || !value || Buffer.byteLength(value) > 1024 || /[\\:\x00-\x1f\x7f]/.test(value) ||
+  if (!safeRelative(value) || Buffer.byteLength(value) > 1024 || /[\\:\x00-\x1f\x7f]/.test(value) ||
       path.posix.isAbsolute(value) || path.win32.isAbsolute(value)) return false;
   const parts = value.split("/");
   if (parts.some((part) => !part || part === "." || part === ".." || DENIED_SEGMENTS.has(part.toLowerCase()))) return false;
@@ -26,10 +26,6 @@ export function readableRepositoryPath(value) {
     !/\.(?:pem|key|p12|pfx|jks|keystore)$/.test(basename);
 }
 
-function equalPath(left, right) {
-  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
-}
-function sameFile(left, right) { return left.dev === right.dev && left.ino === right.ino; }
 function argsObject(args, allowed) {
   if (!args || typeof args !== "object" || Array.isArray(args) ||
       Object.keys(args).some((key) => !allowed.includes(key))) reject();
@@ -45,96 +41,109 @@ function text(value, fallback, maximum) {
   return actual;
 }
 
-export async function createRepositoryReader({ repo, snapshot }) {
-  const root = await fs.realpath(repo);
-  const rootIdentity = await fs.lstat(root);
-  if (!rootIdentity.isDirectory() || rootIdentity.isSymbolicLink()) reject("broker-path-denied");
-  let paths = [...snapshot.paths].filter((relative) => {
+export async function createRepositoryReader({ repo, snapshot, signal }) {
+  const repository = await openRepository(repo, snapshot.rootIdentity);
+  const root = repository.root;
+  const ignored = new Set(snapshot.ignored ?? []);
+  if (!snapshot.ignored) {
+    const all = [...snapshot.paths];
+    for (let offset = 0; offset < all.length; offset += 500) {
+      const outcome = await runBounded("git", ["--no-optional-locks", "-C", root, "check-ignore", "--no-index", "-z", "--stdin"], {
+        input: all.slice(offset, offset + 500).join("\0") + "\0", timeoutMs: 5000, signal, maxBuffer: 1024 * 1024, prefix: "broker-inventory" });
+      if (![0, 1].includes(outcome.status)) reject("broker-inventory-unavailable");
+      for (const relative of outcome.stdout.toString("utf8").split("\0")) if (relative) ignored.add(relative);
+    }
+  }
+  const exclusions = {};
+  const paths = [...snapshot.paths].filter((relative) => {
     const entry = snapshot.entries.get(relative);
-    return readableRepositoryPath(relative) && entry?.kind === "file" && entry.bytes <= MAX_FILE_BYTES;
+    const reason = !readableRepositoryPath(relative) ? "path-policy" : ignored.has(relative) ? "gitignored"
+      : entry?.kind !== "file" ? entry?.kind ?? "unavailable" : entry.bytes > MAX_FILE_BYTES ? "large-file" : null;
+    if (reason) { exclusions[reason] = (exclusions[reason] ?? 0) + 1; return false; }
+    return true;
   }).sort();
-  const ignored = new Set();
-  for (let offset = 0; offset < paths.length; offset += 500) {
-    const outcome = spawnSync("git", ["-C", root, "check-ignore", "--no-index", "-z", "--stdin"], {
-      input: `${paths.slice(offset, offset + 500).join("\0")}\0`, encoding: "utf8",
-      timeout: 5000, maxBuffer: 1024 * 1024, windowsHide: true,
-    });
-    if (outcome.error || ![0, 1].includes(outcome.status)) reject("broker-inventory-unavailable");
-    for (const relative of outcome.stdout.split("\0")) if (relative) ignored.add(relative);
+  const allowed = new Set(paths), secret = randomBytes(32);
+  const excluded = Object.values(exclusions).reduce((a, b) => a + b, 0);
+  const binding = (name, args) => createHash("sha256").update(JSON.stringify([snapshot.public.digest, name, args])).digest("hex");
+  function cursorEncode(bind, position) {
+    const payload = Buffer.from(JSON.stringify({ v: 2, binding: bind, ...position })).toString("base64url");
+    return `${payload}.${createHmac("sha256", secret).update(payload).digest("hex")}`;
   }
-  paths = paths.filter((relative) => !ignored.has(relative));
-  const allowed = new Set(paths);
-
-  async function checkRoot() {
-    const current = await fs.lstat(root);
-    if (current.isSymbolicLink() || !sameFile(rootIdentity, current) || !equalPath(await fs.realpath(root), root)) {
-      reject("broker-path-denied");
-    }
+  function cursorDecode(value, bind, maximum) {
+    if (value === undefined || value === 0) return { index: 0, line: 0, column: 0 };
+    if (typeof value !== "string" || value.length > 1024) reject("broker-invalid-cursor");
+    const [payload, signature, extra] = value.split(".");
+    if (extra || signature !== createHmac("sha256", secret).update(payload).digest("hex")) reject("broker-invalid-cursor");
+    let cursor;
+    try { cursor = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")); } catch { reject("broker-invalid-cursor"); }
+    if (cursor.v !== 2 || cursor.binding !== bind || !Number.isInteger(cursor.index) || cursor.index < 0 || cursor.index > maximum ||
+        !Number.isInteger(cursor.line) || cursor.line < 0 || !Number.isInteger(cursor.column) || cursor.column < 0) reject("broker-invalid-cursor");
+    return cursor;
   }
-  async function checkPath(relative) {
+  const linesOf = (contents) => {
+    const lines = contents.split(/\r?\n/);
+    if (lines.at(-1) === "" && lines.length > 1) lines.pop();
+    return lines;
+  };
+  async function read(relative, callSignal) {
     if (!readableRepositoryPath(relative) || !allowed.has(relative)) reject("broker-path-denied");
-    await checkRoot();
-    let full = root;
-    let info;
-    for (const component of relative.split("/")) {
-      full = path.join(full, component);
-      info = await fs.lstat(full);
-      if (info.isSymbolicLink()) reject("broker-path-denied");
-    }
-    if (!info.isFile() || info.nlink !== 1 || !equalPath(await fs.realpath(full), full)) reject("broker-path-denied");
-    return { full, info };
+    const measured = await repository.read(relative, { collect: true, maximumBytes: MAX_FILE_BYTES,
+      expected: snapshot.entries.get(relative), signal: callSignal ?? signal });
+    let contents;
+    try { contents = new TextDecoder("utf-8", { fatal: true }).decode(measured.contents); }
+    catch { reject("broker-non-text-file"); }
+    if (contents.includes("\0")) reject("broker-non-text-file");
+    if (/^[ \t]*-----BEGIN (?:[A-Z0-9 ]* )?PRIVATE KEY-----[ \t]*\r?$/m.test(contents)) reject("broker-content-denied");
+    return contents;
   }
-  async function read(relative) {
-    const { full, info } = await checkPath(relative);
-    const entry = snapshot.entries.get(relative);
-    if (info.size !== entry.bytes || info.size > MAX_FILE_BYTES) reject("broker-repository-changed");
-    const handle = await fs.open(full, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    try {
-      const opened = await handle.stat();
-      if (!opened.isFile() || opened.nlink !== 1 || !sameFile(info, opened)) reject("broker-path-denied");
-      const buffer = Buffer.alloc(entry.bytes + 1);
-      let used = 0;
-      while (used < buffer.length) {
-        const { bytesRead } = await handle.read(buffer, used, buffer.length - used, used);
-        if (!bytesRead) break;
-        used += bytesRead;
-      }
-      const bytes = buffer.subarray(0, used);
-      const digest = createHash("sha256").update("rg-worktree-entry-file-v1\0").update(bytes).digest("hex");
-      if (used !== entry.bytes || digest !== entry.digest) reject("broker-repository-changed");
-      const after = await checkPath(relative);
-      if (!sameFile(opened, after.info)) reject("broker-path-denied");
-      let contents;
-      try { contents = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
-      catch { reject("broker-non-text-file"); }
-      if (contents.includes("\0") || /-----BEGIN (?:[A-Z0-9 ]* )?PRIVATE KEY-----/.test(contents)) reject("broker-path-denied");
-      return contents;
-    } finally { await handle.close(); }
+  function publicCode(error) {
+    if (error instanceof RepositoryReadError) return error.code;
+    if (["repository-path-denied", "repository-linked-path", "repository-root-changed"].includes(error.code)) return "broker-path-denied";
+    if (["repository-changed", "ENOENT"].includes(error.code)) return "broker-repository-changed";
+    if (["EACCES", "EPERM"].includes(error.code)) return "broker-access-denied";
+    if (error.code === "repository-cancelled") return "broker-request-cancelled";
+    return "broker-read-unavailable";
   }
-
-  async function perform(name, args) {
-    await checkRoot();
+  async function perform(name, args, callSignal) {
+    await repository.checkRoot();
+    if (callSignal?.aborted || signal?.aborted) reject("broker-request-cancelled");
     if (name === "list_files") {
       argsObject(args, ["contains", "cursor", "limit"]);
-      const contains = text(args.contains, "", 256);
-      const cursor = integer(args.cursor, 0, 0, paths.length);
-      const limit = integer(args.limit, 100, 1, 100);
-      const selected = [];
-      let index = cursor;
-      for (; index < paths.length && selected.length < limit; index++) {
-        if (paths[index].includes(contains)) selected.push(paths[index]);
+      const contains = text(args.contains, "", 256), limit = integer(args.limit, 100, 1, 100);
+      const bind = binding(name, { contains }), candidates = paths.filter((p) => p.includes(contains));
+      const { index } = cursorDecode(args.cursor, bind, candidates.length);
+      const selected = []; let bytes = 0;
+      for (const relative of candidates.slice(index, index + limit)) {
+        const size = Buffer.byteLength(JSON.stringify(relative)) + 1;
+        if (bytes + size > 32 * 1024) break;
+        selected.push(relative); bytes += size;
       }
-      return { paths: selected, next_cursor: index < paths.length ? index : null };
+      const next = index + selected.length;
+      return { paths: selected, total_files: candidates.length, remaining_files: candidates.length - next,
+        excluded_files: excluded, exclusion_reasons: exclusions, complete: next === candidates.length,
+        next_cursor: next < candidates.length ? cursorEncode(bind, { index: next, line: 0, column: 0 }) : null };
     }
     if (name === "read_lines") {
-      argsObject(args, ["path", "line_start", "line_end"]);
-      const start = integer(args.line_start, 1, 1, 10_000_000);
-      const end = integer(args.line_end, start + 79, start, start + 199);
-      const contents = await read(args.path);
-      const lines = contents.split(/\r?\n/);
-      if (lines.at(-1) === "" && lines.length > 1) lines.pop();
+      argsObject(args, ["path", "line_start", "line_end", "cursor"]);
+      const start = integer(args.line_start, 1, 1, 10_000_000), end = integer(args.line_end, start + 79, start, start + 199);
+      const bind = binding(name, { path: args.path, start, end });
+      const cursor = cursorDecode(args.cursor, bind, 0);
+      const lines = linesOf(await read(args.path, callSignal));
       if (start > lines.length) reject("broker-invalid-range");
-      return { path: args.path, line_start: start, line_end: Math.min(end, lines.length), text: lines.slice(start - 1, end).join("\n") };
+      const last = Math.min(end, lines.length), first = cursor.line || start - 1;
+      if (first < start - 1 || first >= last || cursor.column > lines[first].length) reject("broker-invalid-cursor");
+      let line = first, column = cursor.column, output = "";
+      // 6000 UTF-16 units fit even worst-case JSON escaping within the output cap.
+      while (line < last && output.length < 6000) {
+        const part = lines[line].slice(column, column + 6000 - output.length);
+        output += part; column += part.length;
+        if (column < lines[line].length || (output.length === 6000 && line + 1 < last)) break;
+        line++; column = 0;
+        if (line < last && output.length < 6000) output += "\n";
+      }
+      const more = line < last;
+      return { path: args.path, line_start: first + 1, line_end: more ? line + 1 : last, column_start: cursor.column + 1,
+        text: output, truncated: more, next_cursor: more ? cursorEncode(bind, { index: 0, line, column }) : null };
     }
     if (name === "search") {
       argsObject(args, ["query", "path", "cursor", "limit"]);
@@ -142,48 +151,53 @@ export async function createRepositoryReader({ repo, snapshot }) {
       if (!query) reject();
       const limit = integer(args.limit, 30, 1, 100);
       if (args.path !== undefined && (!readableRepositoryPath(args.path) || !allowed.has(args.path))) reject("broker-path-denied");
-      const candidates = args.path === undefined ? paths : [args.path];
-      let index = integer(args.cursor, 0, 0, candidates.length);
-      const matches = [];
-      let bytes = 0, scanned = 0, matchesTruncated = false;
-      const deadline = Date.now() + 5000;
-      for (; index < candidates.length; index++) {
-        const relative = candidates[index];
-        if (Date.now() > deadline || scanned >= 1000 || bytes + snapshot.entries.get(relative).bytes > 16 * 1024 * 1024) break;
-        scanned++;
-        bytes += snapshot.entries.get(relative).bytes;
+      const candidates = args.path === undefined ? paths : [args.path], bind = binding(name, { query, path: args.path ?? null });
+      const cursor = cursorDecode(args.cursor, bind, candidates.length);
+      let index = cursor.index, nextLine = cursor.line, scanned = 0, bytes = 0, outputBytes = 0, unreadable = 0;
+      const matches = [], skipped = {}, deadline = Date.now() + 5000;
+      let reason = null;
+      outer: for (; index < candidates.length; index++, nextLine = 0) {
+        const relative = candidates[index], entry = snapshot.entries.get(relative);
+        if (Date.now() > deadline || scanned >= 1000 || bytes + entry.bytes > 16 * 1024 * 1024) { reason = "scan-budget"; break; }
+        if (callSignal?.aborted) reject("broker-request-cancelled");
+        scanned++; bytes += entry.bytes;
         let contents;
-        try { contents = await read(relative); }
+        try { contents = await read(relative, callSignal); }
         catch (error) {
-          if (["broker-non-text-file", "broker-path-denied"].includes(error.code)) continue;
+          const code = publicCode(error);
+          if (["broker-non-text-file", "broker-content-denied", "broker-path-denied", "broker-access-denied"].includes(code)) {
+            unreadable++; skipped[code] = (skipped[code] ?? 0) + 1; continue;
+          }
           throw error;
         }
-        const lines = contents.split(/\r?\n/);
-        for (let line = 0; line < lines.length; line++) {
-          if (lines[line].includes(query)) {
-            if (matches.length === limit) { matchesTruncated = true; break; }
-            matches.push({ path: relative, line: line + 1, text: lines[line].slice(0, 300) });
-          }
+        const lines = linesOf(contents);
+        for (let line = nextLine; line < lines.length; line++) {
+          const column = lines[line].indexOf(query);
+          if (column < 0) continue;
+          const excerptStart = Math.max(0, column - 80), excerpt = lines[line].slice(excerptStart, excerptStart + 300);
+          const match = { path: relative, line: line + 1, column: column + 1, text: excerpt,
+            text_truncated: excerpt.length !== lines[line].length };
+          const size = Buffer.byteLength(JSON.stringify(match));
+          if (matches.length >= limit || outputBytes + size > 32 * 1024) { nextLine = line; reason = "result-budget"; break outer; }
+          matches.push(match); outputBytes += size;
         }
-        if (matches.length >= limit) { index++; break; }
       }
-      return { matches, scanned_files: scanned, truncated: matchesTruncated || index < candidates.length,
-        next_cursor: index < candidates.length ? index : null, matches_truncated_in_last_file: matchesTruncated };
+      const remaining = candidates.length - index;
+      return { matches, scope: "eligible-text-files", total_files: candidates.length, scanned_files: scanned, bytes_read: bytes,
+        excluded_files: excluded, exclusion_reasons: exclusions, unreadable_files: unreadable, unreadable_reasons: skipped,
+        remaining_files: remaining, complete: remaining === 0 && unreadable === 0, truncated: remaining > 0,
+        stop_reason: reason, matches_truncated_in_last_file: remaining > 0 && nextLine > 0,
+        next_cursor: remaining > 0 ? cursorEncode(bind, { index, line: nextLine, column: 0 }) : null };
     }
     reject();
   }
-
-  return {
-    paths: Object.freeze([...paths]),
-    async call(name, args = {}) {
+  return { paths: Object.freeze([...paths]),
+    async call(name, args = {}, options = {}) {
       try {
-        const result = { ...(await perform(name, args)), fingerprint_digest: snapshot.public.digest };
+        const result = { ...(await perform(name, args, options.signal)), fingerprint_digest: snapshot.public.digest };
         if (Buffer.byteLength(JSON.stringify(result)) > MAX_OUTPUT_BYTES) reject("broker-output-limit");
         return result;
-      } catch (error) {
-        if (error instanceof RepositoryReadError) throw error;
-        reject("broker-read-unavailable");
-      }
+      } catch (error) { reject(publicCode(error)); }
     },
   };
 }

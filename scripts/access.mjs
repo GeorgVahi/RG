@@ -1,7 +1,8 @@
-import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { runBounded } from "./bounded-process.mjs";
+import { openRepository } from "./repository-fs.mjs";
 
 // The probe runs inside the same read-only policy as the scout. Only a bounded
 // digest leaves the sandbox; file contents and exception text are never logged.
@@ -30,10 +31,19 @@ function samePath(left, right) {
 
 export async function probeSandboxAccess({
   repo, sample, codexBin = "codex", codexArgsPrefix = [], environment = process.env,
-  execute = spawnSync, timeoutMs = 20_000,
+  execute, timeoutMs = 20_000,
 }) {
   const checks = { parent_read: "not_checked", sandbox_read: "not_checked", cwd: "not_checked" };
   const fail = (failure_reason) => ({ schema: "rg.access.v1", transport: "native", status: "failed", checks, failure_reason });
+  if (!execute) {
+    try {
+      const outcome = await runBounded(process.execPath, [fileURLToPath(new URL("./access-worker.mjs", import.meta.url))], {
+        input: JSON.stringify({ repo, sample, codexBin, codexArgsPrefix, timeoutMs }), env: environment,
+        timeoutMs, maxBuffer: 64 * 1024, prefix: "sandbox-probe" });
+      if (outcome.status !== 0) return fail("sandbox-probe-unavailable");
+      return JSON.parse(outcome.stdout.toString("utf8"));
+    } catch (error) { return fail(error.code === "sandbox-probe-timeout" ? error.code : "sandbox-probe-unavailable"); }
+  }
   if (typeof sample !== "string" || !sample || sample.includes("\\") || sample.includes("\0") ||
       sample.split("/").some((part) => !part || part === "." || part === ".." || part.includes(":")) ||
       path.posix.isAbsolute(sample) || path.win32.isAbsolute(sample)) {
@@ -41,19 +51,11 @@ export async function probeSandboxAccess({
   }
   let root, expected;
   try {
-    root = fs.realpathSync.native(repo);
-    let current = root;
-    for (const component of sample.split("/")) {
-      current = path.join(current, component);
-      if (fs.lstatSync(current).isSymbolicLink()) return fail("sandbox-probe-invalid-sample");
-    }
-    if (!fs.statSync(current).isFile()) return fail("sandbox-probe-invalid-sample");
-    const fd = fs.openSync(current, "r");
-    try {
-      const buffer = Buffer.alloc(4096);
-      const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
-      expected = { bytes, sha256: createHash("sha256").update(buffer.subarray(0, bytes)).digest("hex") };
-    } finally { fs.closeSync(fd); }
+    const repository = await openRepository(repo);
+    root = repository.root;
+    const measured = await repository.read(sample, { collect: true, maximumBytes: 2 * 1024 * 1024 });
+    const buffer = measured.contents.subarray(0, 4096);
+    expected = { bytes: buffer.length, sha256: createHash("sha256").update(buffer).digest("hex") };
     checks.parent_read = "ok";
   } catch {
     checks.parent_read = "failed";
@@ -65,7 +67,7 @@ export async function probeSandboxAccess({
     "-c", 'approval_policy="never"', "-C", root, "--", process.execPath, "-e", PROBE, payload];
   let outcome;
   try {
-    outcome = execute(codexBin, args, {
+    outcome = await execute(codexBin, args, {
       cwd: root, env: environment, encoding: "utf8", windowsHide: true,
       timeout: timeoutMs, maxBuffer: 64 * 1024, stdio: ["ignore", "pipe", "pipe"],
     });
