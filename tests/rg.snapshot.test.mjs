@@ -11,9 +11,12 @@ import { runBounded } from "../scripts/bounded-process.mjs";
 import { openRepository } from "../scripts/repository-fs.mjs";
 
 async function fixture(t) {
-  const repo = await fs.mkdtemp(path.join(os.tmpdir(), "rg-snapshot-test-"));
+  // Windows CI can expose TEMP through an 8.3 alias; hooks must target the same
+  // canonical paths that the production reader inspects.
+  const temporaryRoot = await fs.realpath(os.tmpdir());
+  const repo = await fs.realpath(await fs.mkdtemp(path.join(temporaryRoot, "rg-snapshot-test-")));
   t.after(async () => {
-    assert.equal(path.dirname(repo), path.resolve(os.tmpdir()));
+    assert.equal(path.dirname(repo), temporaryRoot);
     assert.match(path.basename(repo), /^rg-snapshot-test-/);
     await fs.rm(repo, { recursive: true, force: true });
   });

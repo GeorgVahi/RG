@@ -128,9 +128,12 @@ export async function buildSnapshot(repo, { maximumMs = 120_000, concurrency = 8
     // One metadata-only ignore pass, reused by the broker; ignored tracked bytes remain fingerprinted.
     metrics.stage = "ignore-policy"; progress();
     const ignored = new Set();
-    for (let offset = 0; offset < paths.length; offset += 500) {
+    // Git refuses paths beyond symlinks on POSIX. Non-file states are already
+    // ineligible for evidence and must never be traversed for ignore policy.
+    const regularPaths = paths.filter((relative) => entries.get(relative).kind === "file");
+    for (let offset = 0; offset < regularPaths.length; offset += 500) {
       const result = await runBounded("git", ["--no-optional-locks", "-C", repository.root, "check-ignore", "--no-index", "-z", "--stdin"], {
-        input: paths.slice(offset, offset + 500).join("\0") + "\0", timeoutMs: deadline - Date.now(), signal, prefix: "fingerprint-git" });
+        input: regularPaths.slice(offset, offset + 500).join("\0") + "\0", timeoutMs: deadline - Date.now(), signal, prefix: "fingerprint-git" });
       if (![0, 1].includes(result.status)) throw new OperationError("fingerprint-ignore-unavailable");
       for (const relative of decode(result.stdout).split("\0")) if (relative) ignored.add(relative);
     }
