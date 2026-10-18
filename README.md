@@ -31,7 +31,7 @@ Each active run holds a contract-bound heartbeat lease and emits machine-readabl
 
 No npm dependencies are required.
 
-Version 0.4.0 moves the default scout to GPT-6 Luna and the balanced tier from GPT-5.6 Terra to GPT-6 Sol. Existing repo/user model overrides remain in force; see [configuration](references/configuration.md) before upgrading a pinned installation. Version 0.5.0 adds the Claude Code adapter and leaves the Codex route unchanged.
+Version 0.4.0 moves the default scout to GPT-6 Luna and the balanced tier from GPT-5.6 Terra to GPT-6 Sol. Existing repo/user model overrides remain in force; see [configuration](references/configuration.md) before upgrading a pinned installation. Version 0.5.0 adds the Claude Code adapter and leaves the Codex route unchanged. Version 0.5.1 adds sandbox access checks and the optional bounded NAS reader described below.
 
 ## Install as a user skill
 
