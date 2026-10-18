@@ -9,6 +9,7 @@ import {
   RGError,
   buildCodexArgs,
   developerInstructions,
+  doctor,
   failureResult,
   performSearch,
   rgSkillDisablePaths,
@@ -39,11 +40,69 @@ test("fake Codex exercises successful and invalid-result run artifacts", { concu
   const previousScenario = process.env.RG_FAKE_CODEX_SCENARIO;
   const fakeCodex = fileURLToPath(new URL("./fixtures/fake-codex.mjs", import.meta.url));
   await fs.mkdir(path.dirname(linkedSkill), { recursive: true });
-  await fs.symlink(skillRepository, linkedSkill, process.platform === "win32" ? "junction" : "dir");
+  let linkedAvailable = true;
+  try {
+    await fs.symlink(skillRepository, linkedSkill, process.platform === "win32" && !skillRepository.startsWith("\\\\") ? "junction" : "dir");
+  } catch (error) {
+    if (process.platform === "win32" && skillRepository.startsWith("\\\\") && error.code === "EPERM") linkedAvailable = false;
+    else throw error;
+  }
   process.env.CODEX_HOME = home;
 
   try {
-    await t.test("real Codex prompt parser removes RG from the child-visible skill catalog", () => {
+    await t.test("sandbox denial is diagnosed before a model turn or contract repair", async () => {
+      const repo = await repository();
+      process.env.RG_FAKE_CODEX_SCENARIO = "sandbox-denied";
+      try {
+        const diagnostic = await doctor(repo, process.execPath, [fakeCodex]);
+        assert.equal(diagnostic.status, "failed");
+        assert.equal(diagnostic.checks.parent_read, "ok");
+        assert.equal(diagnostic.repository_access.failure_reason, "sandbox-read-denied");
+        await assert.rejects(performSearch({ repo, query: "Locate source.js", codexBin: process.execPath,
+          codexArgsPrefix: [fakeCodex], timeoutMs: 30_000 }), (error) => {
+          assert.equal(error.code, "sandbox-read-denied");
+          assert.equal(error.details.repair, undefined);
+          assert.equal(error.details.receipt, undefined);
+          return true;
+        });
+      } finally { await removeTemporary(repo); }
+    });
+
+    await t.test("explicit broker access uses the real bounded stdio server", async () => {
+      const repo = await repository();
+      process.env.RG_FAKE_CODEX_SCENARIO = "valid-broker";
+      try {
+        const result = await performSearch({ repo, query: "Locate source.js", mode: "auto", accessMode: "broker",
+          codexBin: process.execPath, codexArgsPrefix: [fakeCodex], timeoutMs: 30_000 });
+        assert.equal(result.status, "completed");
+        assert.equal(result.repository_access.transport, "broker");
+        const receipt = JSON.parse(await fs.readFile(result.steps[0].receipt, "utf8"));
+        assert.equal(receipt.repository_access.read_only, true);
+        assert.equal(receipt.sandbox, "read-only");
+      } finally { await removeTemporary(repo); }
+    });
+
+    await t.test("same-model repair preserves broker confinement and tools", async () => {
+      const repo = await repository();
+      process.env.RG_FAKE_CODEX_SCENARIO = "broker-repair";
+      try {
+        const result = await performSearch({ repo, query: "Locate source.js", mode: "auto", accessMode: "broker",
+          codexBin: process.execPath, codexArgsPrefix: [fakeCodex], timeoutMs: 30_000 });
+        assert.equal(result.status, "completed");
+        assert.equal(result.steps.length, 1);
+        assert.equal(result.steps[0].repair.attempted, true);
+        assert.equal(result.steps[0].repair.outcome, "completed");
+        assert.equal(result.repository_access.transport, "broker");
+        const receipt = JSON.parse(await fs.readFile(result.steps[0].receipt, "utf8"));
+        assert.equal(receipt.repository_access.read_only, true);
+      } finally { await removeTemporary(repo); }
+    });
+
+    await t.test("real Codex prompt parser removes RG from the child-visible skill catalog", (subtest) => {
+      if (!linkedAvailable) {
+        subtest.skip("Windows lacks privilege to create the UNC skill symlink; junctions cannot target UNC");
+        return;
+      }
       const environment = { ...process.env, CODEX_HOME: home };
       const control = spawnSync("codex", ["debug", "prompt-input", "bounded repository search"], {
         cwd: skillRepository,

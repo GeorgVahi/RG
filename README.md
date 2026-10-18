@@ -82,6 +82,19 @@ An `auto` search can take longer than any number of shell-tool wait windows. A r
 
 Configuration precedence and the immutable routing constraints are documented in [references/configuration.md](references/configuration.md).
 
+### NAS / UNC repositories
+
+RG tests actual sandbox file reads before a model starts. `doctor` separates configuration, parent access, and sandbox access; a sandbox denial fails early instead of becoming an invalid model response.
+
+If the parent can read an authorized NAS repository but the native sandbox cannot, select the bounded reader explicitly:
+
+```text
+node scripts/rg.mjs doctor --repo <git-root> --access broker
+node scripts/rg.mjs search --repo <git-root> --mode auto --access broker --query <request>
+```
+
+The broker reads the repository in place through three read-only MCP tools. It checks paths and fingerprints, refuses links and common secret paths, and limits returned content. The scout keeps its read-only sandbox with shell and unrelated tools disabled. There is no local repository copy or permanent configuration change. The default remains `--access native`; see [access limits and diagnostics](references/configuration.md#repository-access-and-nas).
+
 ## Verify
 
 ```text

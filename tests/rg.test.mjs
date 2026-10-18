@@ -95,12 +95,20 @@ test("canonical JSON is stable across object key order", () => {
   assert.equal(canonicalJson({ b: 2, a: 1 }), canonicalJson({ a: 1, b: 2 }));
 });
 
-test("CLI entrypoint runs when the skill directory is reached through a link", async () => {
+test("CLI entrypoint runs when the skill directory is reached through a link", async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rg-test-link-"));
   const linked = path.join(directory, "rg");
   const repository = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
   try {
-    await fs.symlink(repository, linked, process.platform === "win32" ? "junction" : "dir");
+    try {
+      await fs.symlink(repository, linked, process.platform === "win32" && !repository.startsWith("\\\\") ? "junction" : "dir");
+    } catch (error) {
+      if (process.platform === "win32" && repository.startsWith("\\\\") && error.code === "EPERM") {
+        t.skip("Windows cannot create a UNC directory symlink without symlink privilege; junctions do not support UNC targets");
+        return;
+      }
+      throw error;
+    }
     const result = spawnSync(
       process.execPath,
       [path.join(linked, "scripts", "rg.mjs"), "help"],
@@ -1577,13 +1585,21 @@ test("GPT-6 defaults preserve explicit legacy user and repository model pins", a
   }
 });
 
-test("child instructions and config suppress recursive RG invocation through a linked install", async () => {
+test("child instructions and config suppress recursive RG invocation through a linked install", async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "rg-test-skill-home-"));
   const linked = path.join(directory, "skills", "rg");
   const repository = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
   await fs.mkdir(path.dirname(linked), { recursive: true });
   try {
-    await fs.symlink(repository, linked, process.platform === "win32" ? "junction" : "dir");
+    try {
+      await fs.symlink(repository, linked, process.platform === "win32" && !repository.startsWith("\\\\") ? "junction" : "dir");
+    } catch (error) {
+      if (process.platform === "win32" && repository.startsWith("\\\\") && error.code === "EPERM") {
+        t.skip("Windows cannot create a UNC directory symlink without symlink privilege; junctions do not support UNC targets");
+        return;
+      }
+      throw error;
+    }
     const paths = rgSkillDisablePaths(directory);
     assert.ok(paths.includes(path.resolve(linked, "SKILL.md")));
     assert.ok(paths.includes(await fs.realpath(path.join(repository, "SKILL.md"))));

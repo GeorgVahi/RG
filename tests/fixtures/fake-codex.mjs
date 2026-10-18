@@ -2,6 +2,7 @@
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 function valueAfter(args, flag) {
   const index = args.indexOf(flag);
@@ -34,6 +35,25 @@ async function main() {
     process.stdout.write("Logged in using ChatGPT\n");
     return;
   }
+  if (args[0] === "mcp" && args[1] === "list") {
+    process.stdout.write(JSON.stringify([{ name: "unrelated-server", enabled: true }]));
+    return;
+  }
+  if (args[0] === "sandbox") {
+    if (process.env.RG_FAKE_CODEX_SCENARIO === "sandbox-denied") {
+      process.stdout.write(JSON.stringify({ schema: "rg.sandbox-probe.v1", error: "EACCES" }));
+      process.exitCode = 1;
+      return;
+    }
+    const separator = args.indexOf("--");
+    const result = spawnSync(args[separator + 1], args.slice(separator + 2), {
+      cwd: valueAfter(args, "-C"), encoding: "utf8", windowsHide: true,
+    });
+    process.stdout.write(result.stdout ?? "");
+    process.stderr.write(result.stderr ?? "");
+    process.exitCode = result.status ?? 1;
+    return;
+  }
   if (args[0] !== "exec") throw new Error(`fake Codex received unsupported command ${args[0]}`);
 
   const prompt = await readPrompt();
@@ -43,6 +63,32 @@ async function main() {
   const isRepair = prompt.includes('"schema":"rg.repair.v1"');
   const resultFile = valueAfter(args, "-o");
   const scenario = process.env.RG_FAKE_CODEX_SCENARIO ?? "valid";
+  if (scenario === "sandbox-denied") throw new Error("sandbox denial incorrectly reached model dispatch");
+  if (scenario === "valid-broker" || scenario === "broker-repair") {
+    if (!args.includes("features.shell_tool=false") || !args.includes("--ignore-user-config") ||
+        !args.includes('approval_policy="never"') || valueAfter(args, "--sandbox") !== "read-only") {
+      throw new Error("broker lost read-only confinement");
+    }
+    const config = args.find((arg) => arg.startsWith("mcp_servers="));
+    if (!config.includes('"unrelated-server"={command=') || !config.includes('enabled=false}')) {
+      throw new Error("broker inherited unrelated tools");
+    }
+    const brokerArgs = JSON.parse(/args=(\[.*?\]),required=true/.exec(config)?.[1] ?? "null");
+    if (!brokerArgs) throw new Error("broker arguments missing");
+    const input = [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } } },
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { jsonrpc: "2.0", id: 2, method: "tools/list" },
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "read_lines", arguments: { path: "source.js", line_start: 1, line_end: 3 } } },
+      { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "write_file", arguments: {} } },
+    ].map((request) => JSON.stringify(request)).join("\n") + "\n";
+    const broker = spawnSync(process.execPath, brokerArgs, { input, encoding: "utf8", windowsHide: true, timeout: 10_000 });
+    if (broker.status !== 0) throw new Error("broker transport failed");
+    const replies = broker.stdout.trim().split("\n").map((line) => JSON.parse(line));
+    const read = JSON.parse(replies.find((reply) => reply.id === 3).result.content[0].text);
+    if (read.path !== "source.js" || read.fingerprint_digest !== ownerFingerprint(args).digest ||
+        replies.find((reply) => reply.id === 4).result.isError !== true) throw new Error("broker contract failed");
+  }
   const model = valueAfter(args, "-m");
   if (scenario === "gpt6-evidence-gap") {
     const effort = { "gpt-6-luna": "low", "gpt-6-sol": "medium" }[model];
@@ -55,12 +101,12 @@ async function main() {
   }
   const invalidFlow =
     scenario === "invalid-flow-path-twice" ||
-    ((scenario === "invalid-flow-path" ||
+    ((scenario === "invalid-flow-path" || scenario === "broker-repair" ||
       scenario === "repair-malformed-events" ||
       scenario === "repair-missing-result") &&
       !isRepair);
   const repairedFlow =
-    (scenario === "invalid-flow-path" || scenario === "repair-malformed-events") && isRepair;
+    (scenario === "invalid-flow-path" || scenario === "broker-repair" || scenario === "repair-malformed-events") && isRepair;
   const result = {
     schema: "rg.discovery.v1",
     worktree_fingerprint: ownerFingerprint(args),

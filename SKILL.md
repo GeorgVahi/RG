@@ -41,6 +41,19 @@ Use `--mode fast` only when the request explicitly prefers the cheapest single L
 
 Keep the request bounded and outcome-oriented. Include the symbols, behavior, suspected area, or evidence needed, but do not paste unrelated chat history.
 
+### NAS and sandbox access
+
+The default `--access native` checks actual sandbox reads before starting a model. `doctor` reports configuration, parent reads, and sandbox reads separately; configuration-only success is not proof of repository access. Treat `sandbox-read-denied`, `cwd-mismatch`, probe failures, and `git-unsafe-repository` as infrastructure failures, never semantic gaps or reasons to change models.
+
+For an already-authorized NAS/UNC repository that the parent can read but the native sandbox cannot, explicitly select the bounded read-only broker:
+
+```text
+node <rg-skill-root>/scripts/rg.mjs doctor --repo <git-root> --access broker
+node <rg-skill-root>/scripts/rg.mjs search --repo <git-root> --mode auto --access broker --query <bounded-search-request>
+```
+
+The broker supplies only file listing, literal text search, and bounded line reads from the same repository. It checks inventory, paths, links, and file fingerprints. The scout keeps its read-only sandbox and has shell and unrelated tools disabled. No repository copy, network drive mapping, global configuration change, or NAS credential transfer is needed. Select the transport explicitly; never disable the sandbox or switch access mechanisms while a run is still live. Broker access does not authorize another repository or override an administrator's restriction. Read [configuration](references/configuration.md#repository-access-and-nas) for limits and diagnostics.
+
 The route may outlive any number of shell-tool wait windows. If the invocation returns a live `session_id` or `cell_id` without a terminal `exit_code`, the runner is still working: continue the same process with the tool's `write_stdin` or `wait` mechanism until it exits. A polling-window count or caller-side wall-clock window never changes `RUNNING` into failure. In particular, never conclude that the scout failed merely because two or more waits returned no final packet.
 
 Each route step immediately emits an `RG_PROGRESS` object with schema `rg.progress.v1` and refreshes it every 30 seconds while the worker is live. It includes `run_id`, `terminal: false`, `fallback_allowed: false`, and `polling_windows_affect_state: false`. Lines such as `RG: starting ...`, `RG_PROGRESS ...`, and `RG: completed ...` are progress messages, not the structured result and not a failure.
@@ -66,4 +79,4 @@ Classify the runner as failed only after the process has exited or otherwise rea
 - If `status` is `completed_with_gaps`, perform only the minimum targeted root recovery needed for the current task and disclose that recovery.
 - If the runner fails, do not create a replacement agent or silently change models. Report the failure briefly and use only minimum targeted root recovery when the parent task can safely continue.
 
-Run `node <rg-skill-root>/scripts/rg.mjs doctor --repo <git-root>` when configuration or authentication needs diagnosis. Read [configuration](references/configuration.md) only when changing RG profiles, model maps, or installation behavior.
+Run `node <rg-skill-root>/scripts/rg.mjs doctor --repo <git-root>` when configuration, authentication, or filesystem access needs diagnosis. Read [configuration](references/configuration.md) when changing profiles, installation, or repository access.

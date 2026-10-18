@@ -32,6 +32,31 @@ Version 0.4.0 defaults to `gpt-6-luna`/`low` and `gpt-6-sol`/`medium`. Sol fills
 - Every Codex child is subscription-authenticated, read-only, ephemeral, and launched with explicit model and reasoning arguments.
 - Every Codex child disables the RG skill only in its own process configuration so global `$rg` routing cannot recurse inside the already-delegated scout.
 
+## Repository access and NAS
+
+Repository access is independent of the model route. Both `search` and `doctor` accept `--access native|broker`; the default is `native`. There is no automatic change of transport or sandbox privileges. Access failures happen before a model turn, contract repair, or model escalation.
+
+`native` launches a fixed Node probe through `codex sandbox --include-managed-config --permission-profile :read-only`. The installed CLI must support these flags. The probe compares the actual child working directory and a nonce-bound digest of at most 4096 bytes with the parent read. It never emits file contents. Unsupported CLI/sandbox combinations fail explicitly instead of falling back to unsandboxed execution. `doctor` now returns a nonzero exit code when the selected access transport fails; scripts that previously treated configuration-only `ok` as readiness must inspect `repository_access` and `checks`.
+
+For a NAS/UNC root that the parent can read but the native sandbox cannot:
+
+```text
+node scripts/rg.mjs doctor --repo <git-root> --access broker
+node scripts/rg.mjs search --repo <git-root> --access broker --mode auto --query <request>
+```
+
+`broker` is an explicitly selected local stdio MCP process under the invoking user's existing filesystem identity. It is a separate trust boundary from the shell sandbox. It exposes only `list_files`, literal `search`, and `read_lines`, with no arbitrary command execution, writes, or network listener. It reads the canonical repository in place; only bounded results and ordinary run artifacts are retained, not a local checkout. The child still uses `--sandbox read-only` and `approval_policy=never`. Its user config is excluded to prevent inherited MCP transport merging; the parent still resolves and validates model overrides and subscription configuration. Managed Codex requirements remain applicable. Shell, plugins, apps, hooks, browser/computer tools, and unrelated configured MCP servers are disabled for this child. These overrides are process-local and do not edit global configuration.
+
+The broker fixes its root and inventory to the owner's fingerprint. Every file read checks path components, canonical paths, root/file identity, regular-file type, single-link count, bounded size, UTF-8, and content digest before returning bytes. Traversal, alternate data streams, symlinks/junctions, hardlinks, Git-ignored content (including tracked ignored files), generated/dependency directories, and common secret-file paths are refused. This denylist is not a general detector of secrets embedded in source files.
+
+Limits: 2 MiB per readable file; 200 lines per read; 48 KiB per result; 100 list/search results; a search scans at most 1000 files, 16 MiB, or five seconds before reporting truncation. Search is literal, not regex. Use `next_cursor` for pagination and `read_lines` when matches in the last file are truncated. MCP requests are bounded to 64 KiB, 512 requests per process, and a 20-second tool deadline. The normal whole-worktree drift check and single restart still apply after a search.
+
+`repository_access` in the result and receipt records the selected transport and native probe. A broker `doctor` can correctly report overall `ok`, `sandbox_read: failed`, and `broker_read: ok`: only the selected broker transport is ready. A native failure never appears as `invalid-result` just because the scout could not inspect files.
+
+`git-unsafe-repository` is independent of NAS sandbox access. Trust only the exact user-approved repository through Git's `safe.directory` mechanism; do not use a wildcard. RG does not modify global Git trust. Once the parent has resolved the repository, its broker uses a child-local Git trust entry for that same root. Preserve existing scoped Git configuration when invoking the parent runner.
+
+On Windows CLI 0.144.3, the tested unelevated sandbox denied direct UNC reads and rejected a restricted read profile requiring elevated setup; MXC was unsupported. The broker completed a real model search on the NAS without changing Windows setup, enabling unrestricted network access, or copying the repository. Newer native backends may differ; rely on the probe rather than a version assumption.
+
 ## Invalid-result diagnostics
 
 Failed result validation emits a bounded, machine-readable `validation_errors` array in both the CLI `rg.run.v1` failure and `receipt.json`. Entries contain `category`, `field`, and `message`; `rejected_value` is present only for a safe repository-relative path. `validation_error_count` records the total and `validation_errors_truncated` reports whether the 128-entry output limit was reached. Current categories are `unsafe-path`, `path-outside-inventory`, `ignored-content`, `linked-path`, `invalid-line-range`, `line-range-no-overlap`, `invalid-fields`, `fingerprint-mismatch`, and `malformed-result`.
@@ -76,7 +101,7 @@ The checked-in GitHub Actions workflow runs that same command on Node.js 20 and 
 
 Install or link the repository as a user skill under the active Codex skill directory. Keep implicit invocation enabled in `agents/openai.yaml`. A concise global `~/.codex/AGENTS.md` rule may require `$rg` before non-trivial repository search; new sessions are required for global instruction changes.
 
-`doctor` checks configuration and ChatGPT login without a model turn. It does not prove hosted model availability; verify that with a bounded search for each configured tier. For `fingerprint-drift`, finish or pause concurrent edits in the target repository before rerunning the search.
+`doctor` checks configuration, ChatGPT login, and the selected repository access transport without a model turn. It does not prove hosted model availability; verify that with a bounded search for each configured tier. For `fingerprint-drift`, finish or pause concurrent edits in the target repository before rerunning the search.
 
 ```text
 node <rg-skill-root>/scripts/rg.mjs doctor --repo <git-root>

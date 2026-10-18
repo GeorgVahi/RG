@@ -9,7 +9,7 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "test:unit": "node --test tests/rg.test.mjs",
+    "test:unit": "node --test tests/rg.test.mjs tests/rg.access.test.mjs tests/rg.broker.test.mjs",
     "test:integration": "node --test tests/rg.integration.test.mjs",
     "canary": "node scripts/canary.mjs",
     "validate": "node scripts/validate-skill.mjs",
