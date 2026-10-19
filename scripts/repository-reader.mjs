@@ -2,6 +2,7 @@ import path from "node:path";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { runBounded } from "./bounded-process.mjs";
 import { openRepository, safeRelative } from "./repository-fs.mjs";
+import { isCatalog, assertCurrentIgnorePolicy } from "./catalog.mjs";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 48 * 1024;
@@ -12,9 +13,9 @@ const DENIED_SEGMENTS = new Set([
 ]);
 
 export class RepositoryReadError extends Error {
-  constructor(code) { super(code); this.name = "RepositoryReadError"; this.code = code; }
+  constructor(code, bytes = 0) { super(code); this.name = "RepositoryReadError"; this.code = code; this.bytes = bytes; }
 }
-const reject = (code = "broker-invalid-request") => { throw new RepositoryReadError(code); };
+const reject = (code = "broker-invalid-request", bytes = 0) => { throw new RepositoryReadError(code, bytes); };
 
 export function readableRepositoryPath(value) {
   if (!safeRelative(value) || Buffer.byteLength(value) > 1024 || /[\\:\x00-\x1f\x7f]/.test(value) ||
@@ -41,8 +42,9 @@ function text(value, fallback, maximum) {
   return actual;
 }
 
-export async function createRepositoryReader({ repo, snapshot, signal }) {
+export async function createRepositoryReader({ repo, snapshot, signal, onObservation = async () => {} }) {
   const repository = await openRepository(repo, snapshot.rootIdentity);
+  const live = isCatalog(snapshot), observed = new Map();
   const root = repository.root;
   const ignored = new Set(snapshot.ignored ?? []);
   if (!snapshot.ignored) {
@@ -58,7 +60,7 @@ export async function createRepositoryReader({ repo, snapshot, signal }) {
   const paths = [...snapshot.paths].filter((relative) => {
     const entry = snapshot.entries.get(relative);
     const reason = !readableRepositoryPath(relative) ? "path-policy" : ignored.has(relative) ? "gitignored"
-      : entry?.kind !== "file" ? entry?.kind ?? "unavailable" : entry.bytes > MAX_FILE_BYTES ? "large-file" : null;
+      : entry?.kind !== "file" && !(live && entry?.kind === "candidate") ? entry?.kind ?? "unavailable" : entry.bytes > MAX_FILE_BYTES ? "large-file" : null;
     if (reason) { exclusions[reason] = (exclusions[reason] ?? 0) + 1; return false; }
     return true;
   }).sort();
@@ -85,23 +87,37 @@ export async function createRepositoryReader({ repo, snapshot, signal }) {
     if (lines.at(-1) === "" && lines.length > 1) lines.pop();
     return lines;
   };
-  async function read(relative, callSignal) {
+  async function read(relative, callSignal, remainingBytes = Infinity) {
     if (!readableRepositoryPath(relative) || !allowed.has(relative)) reject("broker-path-denied");
+    let inspection;
+    if (live) {
+      inspection = await repository.inspect(relative);
+      if (inspection.info.size > remainingBytes && inspection.info.size <= MAX_FILE_BYTES) reject("broker-scan-budget");
+      await assertCurrentIgnorePolicy(root, relative, { signal: callSignal ?? signal });
+    }
     const measured = await repository.read(relative, { collect: true, maximumBytes: MAX_FILE_BYTES,
-      expected: snapshot.entries.get(relative), signal: callSignal ?? signal });
+      expected: live ? undefined : snapshot.entries.get(relative), inspection, signal: callSignal ?? signal });
     let contents;
     try { contents = new TextDecoder("utf-8", { fatal: true }).decode(measured.contents); }
-    catch { reject("broker-non-text-file"); }
-    if (contents.includes("\0")) reject("broker-non-text-file");
-    if (/^[ \t]*-----BEGIN (?:[A-Z0-9 ]* )?PRIVATE KEY-----[ \t]*\r?$/m.test(contents)) reject("broker-content-denied");
+    catch { reject("broker-non-text-file", measured.bytes); }
+    if (contents.includes("\0")) reject("broker-non-text-file", measured.bytes);
+    if (/^[ \t]*-----BEGIN (?:[A-Z0-9 ]* )?PRIVATE KEY-----[ \t]*\r?$/m.test(contents)) reject("broker-content-denied", measured.bytes);
+    if (live) {
+      const previous = observed.get(relative);
+      if (!previous || previous.digest !== measured.digest) await onObservation(relative, measured);
+      if (previous && previous.digest !== measured.digest) reject("broker-repository-changed", measured.bytes);
+      observed.set(relative, { kind: "file", bytes: measured.bytes, lines: measured.lines, digest: measured.digest });
+    }
     return contents;
   }
   function publicCode(error) {
     if (error instanceof RepositoryReadError) return error.code;
+    if (["broker-path-denied", "broker-policy-unavailable", "broker-policy-timeout"].includes(error.code)) return error.code;
     if (["repository-path-denied", "repository-linked-path", "repository-root-changed"].includes(error.code)) return "broker-path-denied";
     if (["repository-changed", "ENOENT"].includes(error.code)) return "broker-repository-changed";
     if (["EACCES", "EPERM"].includes(error.code)) return "broker-access-denied";
     if (error.code === "repository-cancelled") return "broker-request-cancelled";
+    if (error.code === "repository-byte-limit") return "broker-large-file";
     return "broker-read-unavailable";
   }
   async function perform(name, args, callSignal) {
@@ -120,7 +136,7 @@ export async function createRepositoryReader({ repo, snapshot, signal }) {
       }
       const next = index + selected.length;
       return { paths: selected, total_files: candidates.length, remaining_files: candidates.length - next,
-        excluded_files: excluded, exclusion_reasons: exclusions, complete: next === candidates.length,
+        excluded_files: excluded, exclusion_reasons: exclusions, complete: next === candidates.length && (!live || snapshot.catalog.untracked === "complete"),
         next_cursor: next < candidates.length ? cursorEncode(bind, { index: next, line: 0, column: 0 }) : null };
     }
     if (name === "read_lines") {
@@ -160,16 +176,20 @@ export async function createRepositoryReader({ repo, snapshot, signal }) {
         const relative = candidates[index], entry = snapshot.entries.get(relative);
         if (Date.now() > deadline || scanned >= 1000 || bytes + entry.bytes > 16 * 1024 * 1024) { reason = "scan-budget"; break; }
         if (callSignal?.aborted) reject("broker-request-cancelled");
-        scanned++; bytes += entry.bytes;
+        scanned++;
         let contents;
-        try { contents = await read(relative, callSignal); }
+        try { contents = await read(relative, callSignal, 16 * 1024 * 1024 - bytes); }
         catch (error) {
           const code = publicCode(error);
-          if (["broker-non-text-file", "broker-content-denied", "broker-path-denied", "broker-access-denied"].includes(code)) {
+          if (code === "broker-scan-budget") { scanned--; reason = "scan-budget"; break; }
+          bytes += error instanceof RepositoryReadError ? error.bytes : 0;
+          if (["broker-non-text-file", "broker-content-denied", "broker-path-denied", "broker-access-denied", "broker-large-file",
+            ...(live ? ["broker-repository-changed"] : [])].includes(code)) {
             unreadable++; skipped[code] = (skipped[code] ?? 0) + 1; continue;
           }
           throw error;
         }
+        bytes += live ? observed.get(relative).bytes : entry.bytes;
         const lines = linesOf(contents);
         for (let line = nextLine; line < lines.length; line++) {
           const column = lines[line].indexOf(query);
@@ -185,7 +205,7 @@ export async function createRepositoryReader({ repo, snapshot, signal }) {
       const remaining = candidates.length - index;
       return { matches, scope: "eligible-text-files", total_files: candidates.length, scanned_files: scanned, bytes_read: bytes,
         excluded_files: excluded, exclusion_reasons: exclusions, unreadable_files: unreadable, unreadable_reasons: skipped,
-        remaining_files: remaining, complete: remaining === 0 && unreadable === 0, truncated: remaining > 0,
+        remaining_files: remaining, complete: remaining === 0 && unreadable === 0 && (!live || snapshot.catalog.untracked === "complete"), truncated: remaining > 0,
         stop_reason: reason, matches_truncated_in_last_file: remaining > 0 && nextLine > 0,
         next_cursor: remaining > 0 ? cursorEncode(bind, { index, line: nextLine, column: 0 }) : null };
     }
@@ -194,7 +214,9 @@ export async function createRepositoryReader({ repo, snapshot, signal }) {
   return { paths: Object.freeze([...paths]),
     async call(name, args = {}, options = {}) {
       try {
-        const result = { ...(await perform(name, args, options.signal)), fingerprint_digest: snapshot.public.digest };
+        const result = { ...(await perform(name, args, options.signal)), fingerprint_digest: snapshot.public.digest,
+          ...(live ? { consistency: "observed-files", inventory: snapshot.catalog,
+            ...(typeof args.path === "string" && observed.has(args.path) ? { content_digest: observed.get(args.path).digest } : {}) } : {}) };
         if (Buffer.byteLength(JSON.stringify(result)) > MAX_OUTPUT_BYTES) reject("broker-output-limit");
         return result;
       } catch (error) { reject(publicCode(error)); }

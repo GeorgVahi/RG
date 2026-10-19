@@ -82,11 +82,62 @@ test("fake Codex exercises successful and invalid-result run artifacts", { concu
         const receipt = JSON.parse(await fs.readFile(result.steps[0].receipt, "utf8"));
         assert.equal(receipt.repository_access.read_only, true);
         assert.equal(receipt.sandbox, "read-only");
-        assert.equal(receipt.measurements.full_snapshots, 2);
+        assert.equal(receipt.measurements.full_snapshots, 0);
+        assert.equal(receipt.consistency.mode, "observed-files");
+        assert.equal(receipt.consistency.verified_files, 1);
         assert.equal(receipt.preparation.dispatched, true);
         const manifest = JSON.parse(await fs.readFile(path.join(path.dirname(result.steps[0].receipt), "snapshot.json"), "utf8"));
-        assert.equal(manifest.schema, "rg.snapshot-manifest.v2");
+        assert.equal(manifest.schema, "rg.catalog-manifest.v1");
         assert.equal(JSON.stringify(manifest).includes("export function owner()"), false);
+      } finally { await removeTemporary(repo); }
+    });
+
+    await t.test("broker completes despite unrelated edits, new files and deletion", async () => {
+      const repo = await repository();
+      process.env.RG_FAKE_CODEX_SCENARIO = "broker-unrelated-drift";
+      await fs.writeFile(path.join(repo, "unrelated.js"), "old build\n");
+      await fs.writeFile(path.join(repo, "deleted-by-other-chat.js"), "old\n");
+      try {
+        const result = await performSearch({ repo, query: "Locate source.js", accessMode: "broker",
+          codexBin: process.execPath, codexArgsPrefix: [fakeCodex], timeoutMs: 30_000 });
+        assert.equal(result.status, "completed");
+        assert.equal(result.restart.attempted, false);
+        assert.equal(result.consistency.verified_files, 1);
+        assert.equal(result.consistency.catalog_files, 3);
+        const receipt = JSON.parse(await fs.readFile(result.steps[0].receipt, "utf8"));
+        assert.equal(receipt.measurements.full_snapshots, 0);
+      } finally { await removeTemporary(repo); }
+    });
+
+    for (const repeated of [false, true]) {
+      await t.test(`broker observed-file drift ${repeated ? "exhausts one restart" : "restarts once and completes"}`, async () => {
+        const repo = await repository();
+        process.env.RG_FAKE_CODEX_SCENARIO = repeated ? "broker-observed-drift-always" : "broker-observed-drift-once";
+        try {
+          const search = performSearch({ repo, query: "Locate source.js", accessMode: "broker",
+            codexBin: process.execPath, codexArgsPrefix: [fakeCodex], timeoutMs: 30_000 });
+          if (repeated) await assert.rejects(search, (error) => error.code === "fingerprint-drift" && error.details.restart.outcome === "exhausted" &&
+            error.details.fingerprint_drift.scope === "observed-files" && error.details.fingerprint_drift.changes.modified === 1);
+          else {
+            const result = await search;
+            assert.equal(result.status, "completed");
+            assert.equal(result.restart.restart_count, 1);
+            assert.equal(result.restart.outcome, "completed");
+            assert.equal(result.consistency.verified_files, 1);
+          }
+        } finally { await removeTemporary(repo); }
+      });
+    }
+
+    await t.test("catalog membership without an actual broker read cannot become evidence", async () => {
+      const repo = await repository();
+      process.env.RG_FAKE_CODEX_SCENARIO = "broker-unobserved";
+      await fs.writeFile(path.join(repo, "unseen.js"), "not read by scout\n");
+      try {
+        await assert.rejects(performSearch({ repo, query: "Locate source.js", accessMode: "broker",
+          codexBin: process.execPath, codexArgsPrefix: [fakeCodex], timeoutMs: 30_000 }), (error) =>
+          error.code === "invalid-result" && error.details.validation_errors.some((issue) => issue.category === "unobserved-evidence") &&
+          error.details.repair.attempted === false);
       } finally { await removeTemporary(repo); }
     });
 
@@ -103,21 +154,22 @@ test("fake Codex exercises successful and invalid-result run artifacts", { concu
         assert.equal(result.repository_access.transport, "broker");
         const receipt = JSON.parse(await fs.readFile(result.steps[0].receipt, "utf8"));
         assert.equal(receipt.repository_access.read_only, true);
-        assert.equal(receipt.measurements.full_snapshots, 4);
+        assert.equal(receipt.measurements.full_snapshots, 0);
+        assert.equal(receipt.measurements.observed_checks, 3);
       } finally { await removeTemporary(repo); }
     });
 
     await t.test("pre-model fingerprint timeout has a terminal receipt and no surviving lease", async () => {
       const repo = await repository(), hook = path.join(repo, "hang-fingerprint.mjs");
       process.env.RG_FAKE_CODEX_SCENARIO = "valid-broker";
-      await fs.writeFile(hook, "import fs from 'node:fs'; if(process.argv[1]?.endsWith('snapshot-worker.mjs')) { fs.promises.open=async()=>new Promise(()=>{}); setInterval(()=>{},1000); }\n");
+      await fs.writeFile(hook, "import fs from 'node:fs'; if(process.argv[1]?.endsWith('catalog-worker.mjs')) { fs.promises.realpath=async()=>new Promise(()=>{}); setInterval(()=>{},1000); }\n");
       const previousOptions = process.env.NODE_OPTIONS;
       process.env.NODE_OPTIONS = `--import=${pathToFileURL(hook).href}`;
       let failure;
       try {
         await assert.rejects(performSearch({ repo, query: "Locate source.js", codexBin: process.execPath,
           codexArgsPrefix: [fakeCodex], accessMode: "broker", timeoutMs: 30_000, fingerprintMs: 1000 }), (error) => {
-          failure = error; return error.code === "fingerprint-timeout";
+          failure = error; return error.code === "catalog-timeout";
         });
         const receipt = JSON.parse(await fs.readFile(failure.details.receipt, "utf8"));
         assert.equal(receipt.status, "failed");

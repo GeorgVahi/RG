@@ -1,0 +1,159 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { execFileSync } from "node:child_process";
+import { buildCatalog, createObservationJournal, appendObservation, verifyObservations, readObservations,
+  encodeCatalogManifest, decodeCatalogManifest, runCatalogOperation } from "../scripts/catalog.mjs";
+import { createRepositoryReader } from "../scripts/repository-reader.mjs";
+import { digest } from "../scripts/snapshot.mjs";
+
+async function fixture(t) {
+  const temporaryRoot = await fs.realpath(os.tmpdir());
+  const base = await fs.realpath(await fs.mkdtemp(path.join(temporaryRoot, "rg-catalog-test-")));
+  const repo = path.join(base, "repo"); await fs.mkdir(repo);
+  t.after(async () => {
+    assert.equal(path.dirname(base), temporaryRoot);
+    assert.match(path.basename(base), /^rg-catalog-test-/);
+    await fs.rm(base, { recursive: true, force: true });
+  });
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+  git("init", "--quiet");
+  await fs.writeFile(path.join(repo, "source.js"), "export const owner = 1;\n");
+  await fs.writeFile(path.join(repo, "unrelated.js"), "build output v1\n");
+  git("add", ".");
+  return { base, repo, git };
+}
+
+async function readerFor(base, repo, snapshot) {
+  snapshot.journal = await createObservationJournal(path.join(base, "observations.jsonl"), snapshot, "test-run");
+  return createRepositoryReader({ repo, snapshot,
+    onObservation: (relative, entry) => appendObservation(snapshot.journal, relative, entry) });
+}
+
+test("catalog never opens unrelated file payloads, even if a build owns them", async (t) => {
+  const { repo } = await fixture(t), original = fs.open;
+  fs.open = async (file, ...args) => {
+    if (file === path.join(repo, "unrelated.js")) assert.fail("catalog opened unrelated content");
+    return original(file, ...args);
+  };
+  try {
+    const snapshot = await buildCatalog(repo);
+    assert.equal(snapshot.public.inventory, "git-path-catalog-v1");
+    assert.equal(snapshot.public.bytes, 0);
+    assert.equal(snapshot.metrics.files_scanned, 0);
+    assert.equal(snapshot.paths.size, 2);
+  } finally { fs.open = original; }
+});
+
+test("unrelated edits, deletion and new files do not invalidate observed evidence", async (t) => {
+  const { base, repo } = await fixture(t), snapshot = await buildCatalog(repo);
+  const reader = await readerFor(base, repo, snapshot);
+  await reader.call("read_lines", { path: "source.js", line_start: 1, line_end: 1 });
+  await fs.writeFile(path.join(repo, "unrelated.js"), "simultaneous build\n");
+  await fs.unlink(path.join(repo, "unrelated.js"));
+  await fs.writeFile(path.join(repo, "new.js"), "new file in another chat\n");
+  const verified = await verifyObservations(snapshot);
+  assert.equal(verified.consistency.verified_files, 1);
+  assert.equal(verified.consistency.atomic, false);
+  assert.equal(verified.lineCounts.get("source.js"), 1);
+  assert.equal(verified.entries.has("unrelated.js"), false);
+  assert.equal(verified.paths.has("new.js"), false);
+  assert.deepEqual(verified.public, snapshot.public);
+});
+
+test("changed observed bytes are rejected even if a later tool error is ignored", async (t) => {
+  const { base, repo } = await fixture(t), snapshot = await buildCatalog(repo);
+  const reader = await readerFor(base, repo, snapshot);
+  await reader.call("read_lines", { path: "source.js" });
+  await fs.writeFile(path.join(repo, "source.js"), "export const owner = 2;\n");
+  await assert.rejects(reader.call("read_lines", { path: "source.js" }), { code: "broker-repository-changed" });
+  await fs.writeFile(path.join(repo, "source.js"), "export const owner = 1;\n");
+  await assert.rejects(verifyObservations(snapshot), { code: "observed-files-changed" });
+});
+
+test("a deletion during discovery is disclosed and does not hide healthy files", async (t) => {
+  const { base, repo } = await fixture(t), snapshot = await buildCatalog(repo);
+  const reader = await readerFor(base, repo, snapshot);
+  await fs.unlink(path.join(repo, "unrelated.js"));
+  const result = await reader.call("search", { query: "owner" });
+  assert.equal(result.matches[0].path, "source.js");
+  assert.equal(result.unreadable_reasons["broker-repository-changed"], 1);
+  assert.equal(result.complete, false);
+  assert.equal((await verifyObservations(snapshot)).consistency.verified_files, 1);
+});
+
+test("slow untracked enumeration yields explicit incomplete catalog, not a failed tracked search", async (t) => {
+  const { base, repo } = await fixture(t);
+  await fs.writeFile(path.join(repo, "new.js"), "new untracked owner\n");
+  const snapshot = await buildCatalog(repo, { untrackedMs: 0 });
+  assert.equal(snapshot.catalog.untracked, "incomplete-timeout");
+  assert.equal(snapshot.paths.has("source.js"), true);
+  assert.equal(snapshot.paths.has("new.js"), false);
+  const reader = await readerFor(base, repo, snapshot);
+  const found = await reader.call("search", { query: "owner", path: "source.js" });
+  assert.equal(found.matches.length, 1);
+  assert.equal(found.complete, false);
+  assert.equal(found.inventory.untracked, "incomplete-timeout");
+  assert.equal((await reader.call("list_files")).complete, false);
+});
+
+test("current ignore policy is checked before disclosure and again before acceptance", async (t) => {
+  const { base, repo } = await fixture(t), snapshot = await buildCatalog(repo);
+  const reader = await readerFor(base, repo, snapshot);
+  await reader.call("read_lines", { path: "source.js" });
+  await fs.writeFile(path.join(repo, ".gitignore"), "source.js\nunrelated.js\n");
+  await assert.rejects(reader.call("read_lines", { path: "unrelated.js" }), { code: "broker-path-denied" });
+  await assert.rejects(verifyObservations(snapshot), { code: "observed-files-changed" });
+});
+
+test("catalog manifest is metadata only, mode-bound, root-bound and integrity checked", async (t) => {
+  const { repo } = await fixture(t), snapshot = await buildCatalog(repo);
+  const manifest = encodeCatalogManifest(snapshot, "test-run");
+  const options = { expectedDigest: manifest.digest, fingerprint: snapshot.public.digest, repo, runId: "test-run" };
+  assert.equal(manifest.content.includes("export const owner"), false);
+  assert.equal((await decodeCatalogManifest(manifest.content, options)).paths.size, 2);
+  await assert.rejects(decodeCatalogManifest(manifest.content, { ...options, runId: "other" }), { code: "broker-manifest-invalid" });
+  const altered = JSON.parse(manifest.content); altered.snapshot.entries.pop();
+  const content = JSON.stringify(altered);
+  await assert.rejects(decodeCatalogManifest(content, { ...options, expectedDigest: digest(content) }), { code: "broker-manifest-invalid" });
+});
+
+test("journal rejects replaced files and incomplete records", async (t) => {
+  const { base, repo } = await fixture(t), snapshot = await buildCatalog(repo);
+  const reader = await readerFor(base, repo, snapshot);
+  await reader.call("read_lines", { path: "source.js" });
+  const file = snapshot.journal.path;
+  const content = await fs.readFile(file);
+  await fs.appendFile(file, "{");
+  await assert.rejects(readObservations(snapshot), { code: "observation-journal-invalid" });
+  await fs.rename(file, path.join(base, "old-journal"));
+  await fs.writeFile(file, content);
+  await assert.rejects(readObservations(snapshot), { code: "observation-journal-invalid" });
+});
+
+test("catalog reader retains junction, hardlink and secret confinement", async (t) => {
+  const { base, repo, git } = await fixture(t);
+  const outside = path.join(base, "outside"); await fs.mkdir(outside);
+  await fs.writeFile(path.join(outside, "secret.js"), "outside secret\n");
+  await fs.mkdir(path.join(repo, "nested"));
+  await fs.writeFile(path.join(repo, "nested", "secret.js"), "inside\n");
+  git("add", ".");
+  await fs.link(path.join(repo, "source.js"), path.join(repo, "hard.js"));
+  await fs.writeFile(path.join(repo, ".env"), "synthetic forbidden fixture\n");
+  const snapshot = await buildCatalog(repo), reader = await readerFor(base, repo, snapshot);
+  await fs.rename(path.join(repo, "nested"), path.join(repo, "moved"));
+  await fs.symlink(outside, path.join(repo, "nested"), process.platform === "win32" ? "junction" : "dir");
+  for (const relative of ["nested/secret.js", "hard.js", ".env", "../outside/secret.js"]) {
+    await assert.rejects(reader.call("read_lines", { path: relative }), { code: "broker-path-denied" });
+  }
+  assert.equal((await readObservations(snapshot)).entries.size, 0);
+});
+
+test("owned catalog worker enforces a real deadline", async (t) => {
+  const { repo } = await fixture(t);
+  const start = Date.now();
+  await assert.rejects(runCatalogOperation("build", repo, { maximumMs: 1 }), { code: "catalog-timeout" });
+  assert.ok(Date.now() - start < 5000);
+});

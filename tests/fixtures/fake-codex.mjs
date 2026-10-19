@@ -64,7 +64,7 @@ async function main() {
   const resultFile = valueAfter(args, "-o");
   const scenario = process.env.RG_FAKE_CODEX_SCENARIO ?? "valid";
   if (scenario === "sandbox-denied") throw new Error("sandbox denial incorrectly reached model dispatch");
-  if (scenario === "valid-broker" || scenario === "broker-repair") {
+  if (scenario === "valid-broker" || scenario.startsWith("broker-")) {
     if (!args.includes("features.shell_tool=false") || !args.includes("--ignore-user-config") ||
         !args.includes('approval_policy="never"') || valueAfter(args, "--sandbox") !== "read-only") {
       throw new Error("broker lost read-only confinement");
@@ -88,6 +88,20 @@ async function main() {
     const read = JSON.parse(replies.find((reply) => reply.id === 3).result.content[0].text);
     if (read.path !== "source.js" || read.fingerprint_digest !== ownerFingerprint(args).digest ||
         replies.find((reply) => reply.id === 4).result.isError !== true) throw new Error("broker contract failed");
+    const brokerRepo = valueAfter(brokerArgs, "--repo");
+    if (scenario === "broker-unrelated-drift") {
+      await fs.writeFile(path.join(brokerRepo, "unrelated.js"), `build ${Date.now()}\n`);
+      await fs.writeFile(path.join(brokerRepo, "new-from-other-chat.js"), "new owner\n");
+      await fs.unlink(path.join(brokerRepo, "deleted-by-other-chat.js"));
+    }
+    if (scenario === "broker-observed-drift-once" || scenario === "broker-observed-drift-always") {
+      const marker = path.join(brokerRepo, ".drift-done");
+      const happened = await fs.stat(marker).catch(() => null);
+      if (!happened || scenario.endsWith("always")) {
+        await fs.appendFile(path.join(brokerRepo, "source.js"), "// changed by another writer\n");
+        await fs.writeFile(marker, "done");
+      }
+    }
   }
   const model = valueAfter(args, "-m");
   if (scenario === "gpt6-evidence-gap") {
@@ -146,6 +160,7 @@ async function main() {
         ? ["trigger:cross-file-gap: The fixture requires a balanced-tier evidence pass."]
         : [],
   };
+  if (scenario === "broker-unobserved") result.owners[0].path = "unseen.js";
   const omitResult =
     (scenario === "missing-result" && !isRepair) ||
     (scenario === "repair-missing-result" && isRepair);
