@@ -73,9 +73,12 @@ export async function openRepository(repo, expectedIdentity) {
       const hash = createHash("sha256").update("rg-worktree-entry-file-v1\0");
       let bytes = 0, newlines = 0, last = -1;
       const chunks = [], buffer = Buffer.allocUnsafe(128 * 1024);
-      while (true) {
+      // The descriptor size is already known. Stop at that boundary instead of
+      // issuing an extra SMB read for EOF; post-read size/timestamps still catch
+      // growth, truncation and replacement, including initially empty files.
+      while (bytes < opened.size) {
         check();
-        const { bytesRead } = await handle.read(buffer, 0, buffer.length, bytes);
+        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, opened.size - bytes), bytes);
         if (!bytesRead) break;
         bytes += bytesRead;
         if (bytes > maximumBytes || bytes > opened.size) fail("repository-changed", relative);

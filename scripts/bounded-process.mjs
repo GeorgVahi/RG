@@ -7,14 +7,14 @@ export class OperationError extends Error {
 // Each process owns its children. On timeout, terminate the tree, not just its pipe.
 export function runBounded(command, args, options = {}) {
   const { timeoutMs = 30_000, signal, maxBuffer = 64 * 1024 * 1024, input,
-    env = process.env, onStderr, prefix = "process" } = options;
+    env = process.env, cwd, onStderr, prefix = "process" } = options;
   if (signal?.aborted) return Promise.reject(new OperationError(`${prefix}-cancelled`));
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return Promise.reject(new OperationError(`${prefix}-timeout`));
   return new Promise((resolve, reject) => {
     // Nested bounded Git calls stay in the outer worker's process group. Creating
     // another detached group would let Git survive termination of that worker.
     const ownsGroup = process.platform !== "win32" && process.env.RG_INTERNAL_PROCESS_GROUP !== "1";
-    const child = spawn(command, args, { env: { ...env, RG_INTERNAL_PROCESS_GROUP: "1" }, windowsHide: true, detached: ownsGroup,
+    const child = spawn(command, args, { cwd, env: { ...env, RG_INTERNAL_PROCESS_GROUP: "1" }, windowsHide: true, detached: ownsGroup,
       stdio: ["pipe", "pipe", "pipe"] });
     let stdout = [], stderr = [], outBytes = 0, errBytes = 0, failure, settled = false, killer;
     const finish = (status) => {

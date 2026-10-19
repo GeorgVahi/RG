@@ -1,6 +1,6 @@
 {
   "name": "@georgvahi/rg-skill",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "private": true,
   "description": "Exact-model Luna-first repository search skill for Codex, with a Claude Code Explore adapter",
   "type": "module",

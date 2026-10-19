@@ -2,7 +2,7 @@ import path from "node:path";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { runBounded } from "./bounded-process.mjs";
 import { openRepository, safeRelative } from "./repository-fs.mjs";
-import { isCatalog, assertCurrentIgnorePolicy } from "./catalog.mjs";
+import { isCatalog, assertCurrentIgnorePolicy, currentIgnoredPaths } from "./catalog.mjs";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 48 * 1024;
@@ -45,13 +45,14 @@ function text(value, fallback, maximum) {
 export async function createRepositoryReader({ repo, snapshot, signal, onObservation = async () => {} }) {
   const repository = await openRepository(repo, snapshot.rootIdentity);
   const live = isCatalog(snapshot), observed = new Map();
+  let scanFileMs = 0;
   const root = repository.root;
   const ignored = new Set(snapshot.ignored ?? []);
   if (!snapshot.ignored) {
     const all = [...snapshot.paths];
     for (let offset = 0; offset < all.length; offset += 500) {
       const outcome = await runBounded("git", ["--no-optional-locks", "-C", root, "check-ignore", "--no-index", "-z", "--stdin"], {
-        input: all.slice(offset, offset + 500).join("\0") + "\0", timeoutMs: 5000, signal, maxBuffer: 1024 * 1024, prefix: "broker-inventory" });
+        input: all.slice(offset, offset + 500).join("\0") + "\0", cwd: path.dirname(process.execPath), timeoutMs: 5000, signal, maxBuffer: 1024 * 1024, prefix: "broker-inventory" });
       if (![0, 1].includes(outcome.status)) reject("broker-inventory-unavailable");
       for (const relative of outcome.stdout.toString("utf8").split("\0")) if (relative) ignored.add(relative);
     }
@@ -87,13 +88,14 @@ export async function createRepositoryReader({ repo, snapshot, signal, onObserva
     if (lines.at(-1) === "" && lines.length > 1) lines.pop();
     return lines;
   };
-  async function read(relative, callSignal, remainingBytes = Infinity) {
+  async function read(relative, callSignal, remainingBytes = Infinity, ignoredBatch, prepared) {
     if (!readableRepositoryPath(relative) || !allowed.has(relative)) reject("broker-path-denied");
     let inspection;
     if (live) {
-      inspection = await repository.inspect(relative);
+      if (ignoredBatch?.has(relative)) reject("broker-path-denied");
+      inspection = prepared ?? await repository.inspect(relative);
       if (inspection.info.size > remainingBytes && inspection.info.size <= MAX_FILE_BYTES) reject("broker-scan-budget");
-      await assertCurrentIgnorePolicy(root, relative, { signal: callSignal ?? signal });
+      if (!ignoredBatch) await assertCurrentIgnorePolicy(root, relative, { signal: callSignal ?? signal });
     }
     const measured = await repository.read(relative, { collect: true, maximumBytes: MAX_FILE_BYTES,
       expected: live ? undefined : snapshot.entries.get(relative), inspection, signal: callSignal ?? signal });
@@ -171,14 +173,43 @@ export async function createRepositoryReader({ repo, snapshot, signal, onObserva
       const cursor = cursorDecode(args.cursor, bind, candidates.length);
       let index = cursor.index, nextLine = cursor.line, scanned = 0, bytes = 0, outputBytes = 0, unreadable = 0;
       const matches = [], skipped = {}, deadline = Date.now() + 5000;
+      const pagePaths = new Set();
+      let ignoredBatch, inspections, inspectionErrors, policyUntil = index;
       let reason = null;
       outer: for (; index < candidates.length; index++, nextLine = 0) {
         const relative = candidates[index], entry = snapshot.entries.get(relative);
         if (Date.now() > deadline || scanned >= 1000 || bytes + entry.bytes > 16 * 1024 * 1024) { reason = "scan-budget"; break; }
         if (callSignal?.aborted) reject("broker-request-cancelled");
+        const fileStarted = Date.now();
+        if (live && index >= policyUntil) {
+          // Carry only a timing estimate across pages, never path permissions or
+          // metadata. Reserve most of a slow page for reads, not unused prefetch.
+          const batchSize = scanFileMs ? Math.max(1, Math.min(16, Math.floor((deadline - Date.now()) / (2 * scanFileMs)))) : 4;
+          const batchEnd = Math.min(index + batchSize, candidates.length, index + 1000 - scanned);
+          const prefetchDeadline = Math.min(deadline, Date.now() + 250);
+          inspections = new Map(); inspectionErrors = new Map();
+          let next = index;
+          // Inspect before Git: check-ignore can reject an entire stdin batch
+          // for a path beyond a symlink. Reuse these exact inspections on open;
+          // descriptor identity and the post-read ancestor checks stay intact.
+          await Promise.all(Array.from({ length: Math.min(4, batchEnd - index) }, async () => {
+            while (next < batchEnd && Date.now() < prefetchDeadline && !callSignal?.aborted && !signal?.aborted) {
+              const candidate = candidates[next++];
+              try { inspections.set(candidate, await repository.inspect(candidate)); }
+              catch (error) { inspectionErrors.set(candidate, error); }
+            }
+          }));
+          if (callSignal?.aborted || signal?.aborted) reject("broker-request-cancelled");
+          policyUntil = next;
+          if (policyUntil === index) { reason = "scan-budget"; break; }
+          ignoredBatch = await currentIgnoredPaths(root, inspections.keys(), { signal: callSignal ?? signal });
+        }
         scanned++;
         let contents;
-        try { contents = await read(relative, callSignal, 16 * 1024 * 1024 - bytes); }
+        try {
+          if (inspectionErrors?.has(relative)) throw inspectionErrors.get(relative);
+          contents = await read(relative, callSignal, 16 * 1024 * 1024 - bytes, ignoredBatch, inspections?.get(relative));
+        }
         catch (error) {
           const code = publicCode(error);
           if (code === "broker-scan-budget") { scanned--; reason = "scan-budget"; break; }
@@ -189,7 +220,9 @@ export async function createRepositoryReader({ repo, snapshot, signal, onObserva
           }
           throw error;
         }
+        finally { scanFileMs = Math.max(1, (scanFileMs + Date.now() - fileStarted) / 2); }
         bytes += live ? observed.get(relative).bytes : entry.bytes;
+        if (live) pagePaths.add(relative);
         const lines = linesOf(contents);
         for (let line = nextLine; line < lines.length; line++) {
           const column = lines[line].indexOf(query);
@@ -202,6 +235,10 @@ export async function createRepositoryReader({ repo, snapshot, signal, onObserva
           matches.push(match); outputBytes += size;
         }
       }
+      // A batch is valid for this page only. Recheck all observed paths before
+      // disclosing any matches, including paths with no matches of their own.
+      if (live && (await currentIgnoredPaths(root, pagePaths, { signal: callSignal ?? signal })).size) reject("broker-path-denied");
+      await repository.checkRoot();
       const remaining = candidates.length - index;
       return { matches, scope: "eligible-text-files", total_files: candidates.length, scanned_files: scanned, bytes_read: bytes,
         excluded_files: excluded, exclusion_reasons: exclusions, unreadable_files: unreadable, unreadable_reasons: skipped,

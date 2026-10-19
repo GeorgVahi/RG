@@ -59,6 +59,12 @@ On Windows CLI 0.144.3, the tested unelevated sandbox denied direct UNC reads an
 
 ## Concurrent builds and edits: broker consistency in 0.7
 
+From 0.7.1, live search checks ignore policy for at most 16 candidate paths at a time, then rechecks all successfully observed paths on that page before returning any matches. These checks include nonmatching files. Up to four readers inspect the batch's safe ancestors before Git; paths already detected as missing or linked are omitted from Git's batch. The same inspections are reused when opening files; descriptor identity and post-read ancestor checks still apply. Prefetch starts conservatively, adjusts its batch size to measured read cost, and stops scheduling after 250 ms or at the page deadline. Only a timing estimate survives between pages, never metadata or permissions. Final verification checks the unchanged observed set after its content reads, in batches of at most 500 paths; already-invalidated paths remain drift. Each Git call retains its five-second cap and NUL-delimited literal paths; invalid output, Git failure, cancellation and deadlines fail closed. Policies are freshly evaluated on every call/page and final verification, including nested ignores and global excludes; no long-lived authorization cache is used. A policy edit during a page can reject that page, and an ignored observed file invalidates final acceptance. As with content verification, this is not an atomic policy snapshot.
+
+File reads stop at the opened descriptor's measured size instead of requesting EOF once more. Short reads continue until that size, while descriptor timestamps, size, link count, file identity and safe ancestors are still checked after reading. Initially empty files and concurrent growth/truncation retain those checks. This saves one filesystem read per file without caching source content or parent-path authorization.
+
+Catalog/policy Git children and catalog workers start in the Node executable's directory to avoid unnecessary UNC working-directory lookups during process startup. Git still selects the canonical NAS repository through its explicit `-C` argument, and workers receive the bound repository in their input. No checkout, content cache, drive mapping or global configuration is created by RG.
+
 `--access broker` now uses observed-file consistency automatically. No broad sandbox permission or new configuration is needed. Startup reads indexed path/stage metadata and attempts untracked enumeration for at most five seconds. It performs **zero whole-tree content hashes**, including during same-model repair. File contents remain on the original filesystem and are read on demand.
 
 The closed discovery schema accepts `git-path-catalog-v1` alongside the native inventory. Its SHA-256 binds the initial catalog and root identity, not repository contents; `bytes: 0` means contents were not prehashed. `rg.catalog-manifest.v1` is a distinct metadata format, with run/root/digest/age binding. Old v2 manifests remain supported with their original full-snapshot meaning. Do not reuse manifests or cursors across runs or versions.
@@ -70,6 +76,21 @@ Before accepting a result, the owner reopens and hashes that read set, checks cu
 `consistency` in the final result and receipt contains `mode: observed-files`, `verified_files`, `verified_bytes`, `read_set_digest`, `verified_at`, catalog coverage and `atomic: false`. `measurements` separates catalogs, observed checks and full snapshots. These observations are not an atomic filesystem snapshot, do not cover files added after catalog creation and cannot prove repository-wide absence during concurrent edits. Completed pagination describes the captured candidate catalog, not a frozen worktree. Reverted edits that were never observed cannot be detected.
 
 If untracked enumeration times out, tracked discovery continues with `inventory.untracked: incomplete-timeout` and `complete: false`; no partial Git output is accepted as a complete inventory. Other inventory/I/O failures remain explicit failures. The broker checks Git-ignore rules at read time, so candidate listings are not proof that a file can be disclosed. Keep requests and search paths bounded to avoid turning a small question into an unnecessarily large read set. `doctor --access broker` verifies catalog preparation and probe access, not all project contents; it reports `checks.catalog` and a zero prehashed byte count. A real search verifies the model and read-set completion path.
+
+### NAS measurement, 2026-10-19
+
+Two paired 0.7.0/0.7.1 comparisons on Windows Node 22.18.0 over gigabit SMB used 32 fixed tracked candidates per project, a literal search with no matches, its observation journal, and final verification. The order of old/new search and verification was reversed in the second run. Both versions produced identical verified read-set digests: ALGOFLOW_DEV had 31 files / 581,893 bytes and one explicitly unreadable deleted tracked candidate; BIASMACHINE had 32 files / 1,778,845 bytes. The baseline modules were read from NAS Git directly into memory; no source copies were written.
+
+All timed operations overlapped an isolated ALGOFLOW static build on the NAS. Only the benchmark's own build process was stopped after the measurement window; these load-generator exits are not successful application-build validations. BIASMACHINE remained read-only and other chats continued. OS caches remained enabled. Startup/catalog preparation and model reasoning are excluded.
+
+| Read workload | First series, old → new | Second series, old → new | Paired speedup |
+| --- | --- | --- | --- |
+| ALGOFLOW_DEV | 3.466 → 1.817 s | 3.474 → 0.869 s | 1.9× / 4.0× |
+| BIASMACHINE | 3.070 → 0.474 s | 3.441 → 0.791 s | 6.5× / 4.4× |
+
+Git launches for search plus verification fell from 62/64 to 5 per project. Node file-read calls fell from 128 to 66 in ALGOFLOW_DEV and from 144 to 80 in BIASMACHINE; the two content passes saved one EOF read per observed file per pass. Guarded metadata checks remain in place. Earlier exploratory variants encountered a prefetch regression and five-second Git policy timeouts under much slower SMB access; those runs were excluded from successful timings and prompted bounded adaptive prefetch and process-startup changes. A stalled single-path Git check can still fail at the unchanged deadline. These small, paired measurements are not a worst-case or end-to-end model latency guarantee.
+
+A final 100-candidate check began 15 seconds into another full ALGOFLOW build. ALGOFLOW_DEV read and verified 99 files / 1,456,323 bytes in 3.095 seconds, explicitly skipping the deleted tracked candidate; BIASMACHINE verified all 100 files / 2,403,313 bytes in 2.395 seconds. Each used nine Git launches. Both workloads finished while the build was active, and that complete build exited successfully after 26.152 seconds.
 
 ## Native snapshot v2, budgets and coverage
 

@@ -25,7 +25,7 @@ export async function buildCatalog(repo, { maximumMs = 120_000, untrackedMs = 50
     const repository = await openRepository(repo);
     metrics.stage = "catalog-index"; progress();
     const git = (args, timeoutMs) => runBounded("git", ["--no-optional-locks", "-C", repository.root, ...args], {
-      timeoutMs: Math.min(timeoutMs, deadline - Date.now()), signal, prefix: "catalog-git", maxBuffer: MAX_SNAPSHOT_BYTES });
+      cwd: path.dirname(process.execPath), timeoutMs: Math.min(timeoutMs, deadline - Date.now()), signal, prefix: "catalog-git", maxBuffer: MAX_SNAPSHOT_BYTES });
     const tracked = await git(["ls-files", "--cached", "--stage", "-z"], maximumMs);
     if (tracked.status !== 0) fail("catalog-index-unavailable");
     const entries = new Map();
@@ -158,11 +158,30 @@ export async function readObservations(snapshot) {
   return { entries, changed };
 }
 
-export async function assertCurrentIgnorePolicy(repo, relative, { signal, deadline = Date.now() + 5000 } = {}) {
-  const outcome = await runBounded("git", ["--no-optional-locks", "-C", repo, "check-ignore", "--no-index", "-q", "--", relative], {
-    timeoutMs: Math.min(5000, deadline - Date.now()), signal, prefix: "broker-policy", maxBuffer: 64 * 1024 });
-  if (outcome.status === 0) fail("broker-path-denied");
-  if (outcome.status !== 1) fail("broker-policy-unavailable");
+// Fresh policy per operation, never a cross-call cache. NUL framing preserves
+// literal Unicode/space/dash paths and --no-index also checks tracked files.
+export async function currentIgnoredPaths(repo, relatives, { signal, deadline = Date.now() + 5000 } = {}) {
+  const paths = [...new Set(relatives)], ignored = new Set();
+  if (!paths.every(safeRelative)) fail("broker-path-denied");
+  for (let offset = 0; offset < paths.length; offset += 500) {
+    const batch = new Set(paths.slice(offset, offset + 500)), input = [...batch].join("\0") + "\0";
+    const outcome = await runBounded("git", ["--no-optional-locks", "-C", repo, "check-ignore", "--no-index", "-z", "--stdin"], {
+      input, cwd: path.dirname(process.execPath), timeoutMs: Math.min(5000, deadline - Date.now()), signal, prefix: "broker-policy",
+      maxBuffer: Math.max(64 * 1024, Buffer.byteLength(input)) });
+    if (![0, 1].includes(outcome.status)) fail("broker-policy-unavailable");
+    let output;
+    try { output = decode(outcome.stdout); } catch { fail("broker-policy-unavailable"); }
+    if ((outcome.status === 1 && output !== "") || (outcome.status === 0 && !output.endsWith("\0"))) fail("broker-policy-unavailable");
+    for (const relative of output ? output.slice(0, -1).split("\0") : []) {
+      if (!batch.has(relative) || ignored.has(relative)) fail("broker-policy-unavailable");
+      ignored.add(relative);
+    }
+  }
+  return ignored;
+}
+
+export async function assertCurrentIgnorePolicy(repo, relative, options) {
+  if ((await currentIgnoredPaths(repo, [relative], options)).has(relative)) fail("broker-path-denied");
 }
 
 export async function verifyObservations(snapshot, { maximumMs = 120_000, signal, onProgress = () => {} } = {}) {
@@ -181,7 +200,6 @@ export async function verifyObservations(snapshot, { maximumMs = 120_000, signal
         const relative = paths[next++];
         try {
           const measured = await repository.read(relative, { expected: entries.get(relative), maximumBytes: 2 * 1024 * 1024, signal, deadline });
-          await assertCurrentIgnorePolicy(repository.root, relative, { signal, deadline });
           metrics.bytes_read += measured.bytes;
         } catch (error) {
           if (!["repository-changed", "ENOENT", "repository-path-denied", "repository-linked-path", "broker-path-denied"].includes(error.code)) throw error;
@@ -193,6 +211,11 @@ export async function verifyObservations(snapshot, { maximumMs = 120_000, signal
     const results = await Promise.allSettled(workers);
     const failed = results.find((result) => result.status === "rejected");
     if (failed) throw failed.reason;
+    // Check the entire read set after reading, so an edit to ignore policy while
+    // another file is being verified cannot leave an earlier observation valid.
+    const unchanged = paths.filter((relative) => !changed.has(relative));
+    for (const relative of await currentIgnoredPaths(repository.root, unchanged, { signal, deadline })) changed.add(relative);
+    await repository.checkRoot();
     // Invalidate an observation without pretending to know replacement bytes or
     // classifying a content edit as a filesystem type change.
     for (const relative of changed) after.set(relative, { ...entries.get(relative), invalidated: true });
@@ -210,6 +233,7 @@ export async function runCatalogOperation(operation, input, limits = {}) {
   let metrics = { stage: operation, files_scanned: 0, bytes_read: 0, elapsed_ms: 0 }, pending = "";
   try {
     const result = await runBounded(process.execPath, [fileURLToPath(new URL("./catalog-worker.mjs", import.meta.url))], {
+      cwd: path.dirname(process.execPath),
       input: JSON.stringify({ operation, input: operation === "verify" ? serializeSnapshot(input) : input, maximumMs }),
       timeoutMs: maximumMs, signal: limits.signal, maxBuffer: MAX_SNAPSHOT_BYTES, prefix: "catalog",
       onStderr(chunk) {
