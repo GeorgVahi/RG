@@ -1,5 +1,7 @@
 # RG
 
+[Latest release: v0.7.1](https://github.com/GeorgVahi/RG/releases/tag/v0.7.1) · [Русская документация](README.ru.md)
+
 RG is a Codex skill for delegating non-trivial repository search to explicit, cheaper model tiers while keeping the parent agent focused on implementation and decisions. A small [Claude Code adapter](#claude-code) applies the same split with a Haiku Explore agent: in our benchmark it cut search token cost by 79% against Opus, and each search took about 1.6× as long.
 
 Its default route is deterministic:
@@ -22,6 +24,19 @@ When owner recomputation proves that the repository changed during a read-only r
 
 Each active run holds a contract-bound heartbeat lease and emits machine-readable `rg.progress.v1` status immediately and every 30 seconds. Every in-process exception is terminalized into its receipt. The read-only `status` command resolves an exact run ID or receipt and returns `rg.status.v1`; polling-window counts never affect state, and `fallback_allowed` is true only for a validated terminal failed receipt. Before search, run-store maintenance marks a `running` receipt older than two hours as failed only when no recent/live lease with the same run ID exists; a future-dated heartbeat is not considered recent without a valid live-owner contract. Receipt lifecycle timestamps from the future are invalid and fail closed. It removes only validated terminal RG run directories: older than 14 days, or beyond the newest 200 after a 24-hour grace period. The home, `rg`, and `runs` directory chain must be real and nonlinked; run creation and every later artifact mutation revalidate that same boundary and the run-directory identity. Per-run atomic maintenance claims serialize reconciliation and deletion so concurrent maintenance counts an object only once. Unknown, malformed, linked, active, and recent entries are never deleted. `doctor` reports the same counters in read-only mode; completed search output includes the maintenance summary.
 
+## Release 0.7.1: faster NAS reads during builds
+
+[RG v0.7.1](https://github.com/GeorgVahi/RG/releases/tag/v0.7.1) combines the 0.7 observed-file broker with batched Git ignore checks, bounded adaptive prefetch and fewer file-read requests. Searches read files directly from the NAS while other work continues; the scout remains read-only, and no local project copy or source cache is created.
+
+Two paired comparisons against 0.7.0 used the same 32 tracked candidates per project while an ALGOFLOW build ran on the NAS. Mean broker search plus final verification time was:
+
+| Project | 0.7.0 | 0.7.1 | Speedup |
+| --- | ---: | ---: | ---: |
+| ALGOFLOW_DEV | 3.47 s | 1.34 s | 2.6× |
+| BIASMACHINE | 3.26 s | 0.63 s | 5.1× |
+
+Git launches fell from 62–64 to five per workload. Startup and model time are excluded; BIASMACHINE was read while ALGOFLOW built, not during a separate BIASMACHINE build. These small measurements do not guarantee worst-case latency. A stalled NAS operation can still reach the unchanged deadline. See the [method, full-build check and limitations](references/configuration.md#nas-measurement-2026-10-19).
+
 ## Requirements
 
 - Node.js 20 or newer
@@ -40,18 +55,20 @@ Clone the repository and link it into the active Codex skills directory. In the 
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/GeorgVahi/RG C:\PROJECTS\RG
+git clone --branch v0.7.1 https://github.com/GeorgVahi/RG C:\PROJECTS\RG
 New-Item -ItemType Junction -Path "$env:USERPROFILE\.codex\skills\rg" -Target "C:\PROJECTS\RG"
 ```
 
 macOS/Linux:
 
 ```sh
-git clone https://github.com/GeorgVahi/RG ~/src/RG
+git clone --branch v0.7.1 https://github.com/GeorgVahi/RG ~/src/RG
 ln -s ~/src/RG ~/.codex/skills/rg
 ```
 
-Start a new Codex session after installation so the skill catalog is reloaded. The skill permits implicit invocation. To make it the persistent default for broad repository search, add this to the active global `AGENTS.md`:
+These commands install the published release tag. For an existing installation, preserve local edits and update the complete skill from tag `v0.7.1` or its source archive, including scripts, schema, profiles and references; replacing only `SKILL.md` is insufficient. Preserve repository/user model overrides outside the packaged skill. No timeout increase or configuration migration is required. Old receipts remain readable, but start a new search instead of reusing an old cursor or fingerprint. Native access remains the default; select `--access broker` explicitly for an authorized NAS repository when needed.
+
+Run `node <rg-skill-root>/scripts/rg.mjs doctor --repo <git-root> --access broker` to check the installed version and NAS access. Start a new Codex session after installation so the skill catalog is reloaded. The skill permits implicit invocation. To make it the persistent default for broad repository search, add this to the active global `AGENTS.md`:
 
 ```md
 ## Default repository search
